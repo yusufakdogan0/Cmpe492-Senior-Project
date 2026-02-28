@@ -5,10 +5,11 @@ This repository contains the codebase for our CMPE 492 Senior Project at Boğazi
 We explore how Large Language Models can effectively decompose high-level missions into manageable subgoals to guide a PPO agent's exploration and decision-making in interactive environments.
 
 **Team:** Onur Küçük & Yusuf Akdoğan  
-**Advisor:** Prof. Dr. Emre Uğur  
+**Advisor:** Emre Uğur  
 
 ## Project Documentation
 All official project documentation, including our timeline, milestones, and methodology, is maintained in the [Repository Wiki](https://github.com/yusufakdogan0/Cmpe492-Senior-Project/wiki).
 
 ## Environment Setup
 *Instructions for setting up the Python environment, installing dependencies (PyTorch, `torch_ac`, Minigrid), and running the training scripts will be populated here as development progresses.*
+

@@ -16,6 +16,8 @@ All official project documentation, including our timeline, milestones, and meth
 492proj/
 ├── models/              # Neural network architectures
 │   └── __init__.py
+├── scripts/             # Training & evaluation entry points
+│   └── train_baseline.py
 ├── checkpoints/         # Saved model weights (git-ignored)
 ├── requirements.txt     # Python dependencies
 └── .gitignore
@@ -23,7 +25,7 @@ All official project documentation, including our timeline, milestones, and meth
 
 ## Environment Setup
 
-**Prerequisites:** Python 3.9, NVIDIA GPU with CUDA support.
+**Prerequisites:** Python 3.13, NVIDIA GPU with CUDA support.
 
 ```bash
 # 1. Create and activate a virtual environment
@@ -34,7 +36,7 @@ venv\Scripts\activate
 # source venv/bin/activate
 
 # 2. Install PyTorch with CUDA support
-pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # 3. Install remaining dependencies
 pip install -r requirements.txt
@@ -44,7 +46,7 @@ pip install -r requirements.txt
 
 | Package | Version | Purpose |
 |---|---|---|
-| PyTorch | 2.5.1 (CUDA) | Deep learning framework |
+| PyTorch | 2.6.0 (CUDA 12.4) | Deep learning framework |
 | torch-ac | 1.4.0 | Actor-critic RL algorithms (PPO) |
 | MiniGrid | latest | Grid-world environments |
 | Gymnasium | latest | Environment interface |

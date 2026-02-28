@@ -1,7 +1,7 @@
 # PyTorch with CUDA support
-# Install torch separately first if needed:
-#   pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
-torch==2.5.1
+# Install torch separately first:
+#   pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0
 
 # RL framework (actor-critic algorithms, PPO, parallel envs)
 torch-ac==1.4.0

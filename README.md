@@ -10,6 +10,43 @@ We explore how Large Language Models can effectively decompose high-level missio
 ## Project Documentation
 All official project documentation, including our timeline, milestones, and methodology, is maintained in the [Repository Wiki](https://github.com/yusufakdogan0/Cmpe492-Senior-Project/wiki).
 
+## Project Structure
+
+```
+492proj/
+├── models/              # Neural network architectures
+│   └── __init__.py
+├── checkpoints/         # Saved model weights (git-ignored)
+├── requirements.txt     # Python dependencies
+└── .gitignore
+```
+
 ## Environment Setup
-*Instructions for setting up the Python environment, installing dependencies (PyTorch, `torch_ac`, Minigrid), and running the training scripts will be populated here as development progresses.*
+
+**Prerequisites:** Python 3.9, NVIDIA GPU with CUDA support.
+
+```bash
+# 1. Create and activate a virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+# source venv/bin/activate
+
+# 2. Install PyTorch with CUDA support
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+
+# 3. Install remaining dependencies
+pip install -r requirements.txt
+```
+
+## Tech Stack
+
+| Package | Version | Purpose |
+|---|---|---|
+| PyTorch | 2.5.1 (CUDA) | Deep learning framework |
+| torch-ac | 1.4.0 | Actor-critic RL algorithms (PPO) |
+| MiniGrid | latest | Grid-world environments |
+| Gymnasium | latest | Environment interface |
+| NumPy | latest | Numerical computing |
 

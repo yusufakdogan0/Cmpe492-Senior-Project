@@ -14,18 +14,24 @@ All official project documentation, including our timeline, milestones, and meth
 
 ```
 492proj/
-├── models/              # Neural network architectures
-│   └── __init__.py
-├── scripts/             # Training & evaluation entry points
-│   └── train_baseline.py
-├── checkpoints/         # Saved model weights (git-ignored)
-├── requirements.txt     # Python dependencies
+├── models/                     # Neural network architectures
+│   ├── __init__.py
+│   └── baseline_agent.py       # Recurrent actor-critic (ConvNet+LSTM / Embedding+GRU)
+├── scripts/                    # Training & evaluation entry points
+│   └── train_baseline.py       # PPO training loop with CSV logging & plotting
+├── utils/                      # Shared utilities for LLM integration
+│   ├── __init__.py
+│   ├── env_parser.py           # MiniGrid observation → JSON for the LLM
+│   └── llm_planner.py          # LLM-based subgoal generation via Ollama
+├── checkpoints/                # Saved model weights (git-ignored)
+├── logs/                       # Training metrics & plots (git-ignored)
+├── requirements.txt            # Python dependencies
 └── .gitignore
 ```
 
 ## Environment Setup
 
-**Prerequisites:** Python 3.13, NVIDIA GPU with CUDA support.
+**Prerequisites:** Python 3.13, NVIDIA GPU with CUDA support, [Ollama](https://ollama.com/download) (for LLM inference).
 
 ```bash
 # 1. Create and activate a virtual environment
@@ -40,6 +46,9 @@ pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 # 3. Install remaining dependencies
 pip install -r requirements.txt
+
+# 4. Pull the LLM model (Qwen 2.5 7B, 4-bit quantized)
+ollama pull qwen2.5:7b
 ```
 
 ## Tech Stack
@@ -51,4 +60,7 @@ pip install -r requirements.txt
 | MiniGrid | latest | Grid-world environments |
 | Gymnasium | latest | Environment interface |
 | NumPy | latest | Numerical computing |
-
+| Matplotlib | latest | Training curve visualization |
+| Requests | latest | HTTP client for Ollama API |
+| Ollama | 0.17+ | Local LLM inference server |
+| Qwen 2.5 7B | q4_K_M | LLM for subgoal generation |

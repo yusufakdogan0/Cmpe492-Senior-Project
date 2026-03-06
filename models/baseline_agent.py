@@ -1,15 +1,12 @@
 """
-Baseline PPO Agent for MiniGrid environments.
+baseline_agent.py — Recurrent actor-critic model for MiniGrid.
 
 Architecture:
-  Visual stream  : 3-layer ConvNet  → flatten → LSTM  (spatial + temporal)
-  Text stream    : Embedding        → GRU              (mission encoding)
-  Fusion         : concat(LSTM_out, GRU_out)
-  Actor head     : FFN → Categorical distribution
-  Critic head    : FFN → scalar value
+  Visual:  3-layer ConvNet → flatten → LSTM (spatial + temporal features)
+  Text:    Word embedding  → GRU        (mission string encoding)
+  Fusion:  concat both streams → actor + critic heads
 
-Conforms to the torch-ac RecurrentACModel interface so it can be
-plugged directly into torch_ac.PPOAlgo.
+Implements the torch-ac RecurrentACModel interface for use with PPO.
 """
 
 import torch
@@ -20,10 +17,9 @@ from torch.distributions import Categorical
 import torch_ac
 
 
-# ──────────────────────────────────────────────
-# Vocabulary  — tiny tokenizer for MiniGrid
-# mission strings  (e.g. "open the yellow door")
-# ──────────────────────────────────────────────
+# --- Vocabulary ---
+# Simple word-level tokenizer for MiniGrid mission strings
+# (e.g. "open the yellow door" → [3, 1, 5, 2])
 
 class Vocabulary:
     """Word-level vocabulary built on the fly from MiniGrid missions."""
@@ -55,25 +51,17 @@ class Vocabulary:
         return tokens
 
 
-# ──────────────────────────────────────────────
-# Baseline Agent
-# ──────────────────────────────────────────────
+# --- Baseline Agent ---
 
 class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
     """
-    Recurrent actor-critic model for MiniGrid.
+    PPO-compatible recurrent agent for MiniGrid tasks.
 
-    Parameters
-    ----------
-    obs_space : gymnasium.spaces.Dict
-        Must contain 'image' (7×7×3) and 'mission' (text).
-    action_space : gymnasium.spaces.Discrete
-        Number of discrete actions.
-    vocab : Vocabulary
-        Shared vocabulary instance (built during preprocessing).
+    Takes dict observations with 'image' (7x7x3) and 'mission' (text),
+    outputs action distribution + value estimate.
     """
 
-    # ---- hyper-parameters (easy to override later) ----
+    # network dimensions
     CONV_CHANNELS  = (16, 32, 64)
     LSTM_HIDDEN    = 128
     EMBED_DIM      = 32
@@ -81,13 +69,13 @@ class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
     FFN_HIDDEN     = 64
     MAX_MISSION_LEN = 16
 
-    def __init__(self, obs_space, action_space, vocab: Vocabulary):
+    def __init__(self, obs_space, action_space, vocab):
         super().__init__()
 
         n_actions = action_space.n
 
-        # ---------- visual stream ----------
-        # Input: (batch, 3, 7, 7)  — channels-first after transpose
+        # -- visual stream --
+        # input: (batch, 3, 7, 7) after NHWC→NCHW transpose
         c1, c2, c3 = self.CONV_CHANNELS
         self.conv = nn.Sequential(
             nn.Conv2d(3, c1, kernel_size=2, stride=1, padding=0),
@@ -98,9 +86,8 @@ class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
             nn.ReLU(),
         )
 
-        # Compute flattened size after conv layers on a 7×7 input
-        # Each Conv2d(kernel=2, stride=1, pad=0) reduces spatial dim by 1
-        # 7 → 6 → 5 → 4    so output is (c3, 4, 4) = 64 * 16 = 1024
+        # after 3 conv layers (kernel=2, stride=1): 7→6→5→4
+        # so output shape is (c3, 4, 4) = 64*16 = 1024
         conv_out_size = c3 * 4 * 4
 
         self.image_lstm = nn.LSTM(
@@ -109,9 +96,9 @@ class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
             batch_first=True,
         )
 
-        # ---------- text stream ----------
+        # -- text stream --
         self.word_embedding = nn.Embedding(
-            num_embeddings=256,          # generous upper bound for MiniGrid vocab
+            num_embeddings=256,         # enough for MiniGrid's small vocab
             embedding_dim=self.EMBED_DIM,
             padding_idx=0,
         )
@@ -121,8 +108,8 @@ class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
             batch_first=True,
         )
 
-        # ---------- fusion / heads ----------
-        fused_dim = self.LSTM_HIDDEN + self.GRU_HIDDEN  # 256
+        # -- actor-critic heads --
+        fused_dim = self.LSTM_HIDDEN + self.GRU_HIDDEN  # 128 + 128 = 256
 
         self.actor = nn.Sequential(
             nn.Linear(fused_dim, self.FFN_HIDDEN),
@@ -136,64 +123,51 @@ class BaselineAgent(nn.Module, torch_ac.RecurrentACModel):
             nn.Linear(self.FFN_HIDDEN, 1),
         )
 
-        # store vocab reference (used by the preprocessor, not by forward)
         self.vocab = vocab
 
-    # ---- torch-ac interface --------------------------------
+    # -- torch-ac interface --
 
     @property
-    def memory_size(self) -> int:
-        """Size of the recurrent hidden state expected by torch-ac."""
-        #  We store both (h, c) of the LSTM packed into one vector.
+    def memory_size(self):
+        """LSTM state size: we pack both h and c into one vector."""
         return 2 * self.LSTM_HIDDEN
 
     def forward(self, obs, memory):
         """
-        Parameters
-        ----------
-        obs : namespace/object with
-            .image  — float tensor (batch, 3, 7, 7)
-            .text   — long  tensor (batch, max_mission_len)
-        memory : tensor (batch, memory_size)
-            Packed LSTM (h, c) from previous step.
+        obs.image: float (batch, 3, 7, 7)
+        obs.text:  long  (batch, max_mission_len)
+        memory:    (batch, 2*LSTM_HIDDEN) — packed LSTM state from prev step
 
-        Returns
-        -------
-        dist   : Categorical  — action distribution
-        value  : Tensor       — value estimate  (batch,)
-        memory : Tensor       — updated hidden state (batch, memory_size)
+        Returns: (action_dist, value, new_memory)
         """
         batch_size = obs.image.shape[0]
 
-        # ---- visual stream ----
+        # visual stream
         x = self.conv(obs.image)                         # (B, 64, 4, 4)
         x = x.reshape(batch_size, -1)                    # (B, 1024)
-        x = x.unsqueeze(1)                               # (B, 1, 1024) — single time-step
+        x = x.unsqueeze(1)                               # (B, 1, 1024)
 
-        # Unpack LSTM hidden state from memory
-        h = memory[:, :self.LSTM_HIDDEN].unsqueeze(0).contiguous()   # (1, B, 128)
-        c = memory[:, self.LSTM_HIDDEN:].unsqueeze(0).contiguous()   # (1, B, 128)
+        # unpack LSTM state
+        h = memory[:, :self.LSTM_HIDDEN].unsqueeze(0).contiguous()
+        c = memory[:, self.LSTM_HIDDEN:].unsqueeze(0).contiguous()
 
-        x, (h_new, c_new) = self.image_lstm(x, (h, c))  # x: (B, 1, 128)
+        x, (h_new, c_new) = self.image_lstm(x, (h, c))
         visual_out = x.squeeze(1)                        # (B, 128)
 
-        # Pack updated hidden state back into memory
         new_memory = torch.cat(
             [h_new.squeeze(0), c_new.squeeze(0)], dim=1
-        )                                                # (B, 256)
+        )
 
-        # ---- text stream ----
+        # text stream
         emb = self.word_embedding(obs.text)              # (B, L, 32)
-        _, h_text = self.text_gru(emb)                   # h_text: (1, B, 128)
+        _, h_text = self.text_gru(emb)                   # (1, B, 128)
         text_out = h_text.squeeze(0)                     # (B, 128)
 
-        # ---- fusion ----
+        # fuse and compute outputs
         fused = torch.cat([visual_out, text_out], dim=1) # (B, 256)
 
-        # ---- heads ----
-        logits = self.actor(fused)                       # (B, n_actions)
+        logits = self.actor(fused)
         dist = Categorical(logits=logits)
-
-        value = self.critic(fused).squeeze(1)            # (B,)
+        value = self.critic(fused).squeeze(1)
 
         return dist, value, new_memory

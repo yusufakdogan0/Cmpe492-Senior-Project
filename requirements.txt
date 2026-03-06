@@ -17,3 +17,6 @@ numpy
 
 # Visualization
 matplotlib
+
+# HTTP client (Ollama API calls)
+requests

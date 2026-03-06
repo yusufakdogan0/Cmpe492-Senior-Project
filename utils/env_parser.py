@@ -1,71 +1,49 @@
 """
-Environment Parser for MiniGrid.
+env_parser.py — Converts MiniGrid observations to JSON for the LLM.
 
-Translates a MiniGrid egocentric (7, 7, 3) visual observation into a
-strict JSON string for an LLM planner.
+Takes the raw (7,7,3) egocentric grid and produces a compact JSON with:
+  - inventory (what the agent is carrying)
+  - boundaries (wall distances via ray casting)
+  - entities  (visible doors, keys, goals, etc. with relative positions)
 
-This module does NOT include the mission string. Its sole job is
-translating the visual matrix. The LLMPlanner will combine this
-output with the mission text later.
-
-Usage
------
-    from utils.env_parser import parse_env_description
-
-    obs, _ = env.reset()
-    json_str = parse_env_description(obs["image"], env.unwrapped.carrying)
+Does NOT include mission text — that's handled by the planner.
 """
 
 import json
 import numpy as np
 from minigrid.core.constants import IDX_TO_OBJECT, IDX_TO_COLOR
 
-# ──────────────────────────────────────────────
-# Constants
-# ──────────────────────────────────────────────
+# --- Constants ---
 
-# Object IDs to ignore
-IGNORE_IDS = {0, 1, 2, 3}   # 0: unseen, 1: empty, 2: wall, 3: floor
+IGNORE_IDS = {0, 1, 2, 3}   # 0=unseen, 1=empty, 2=wall, 3=floor
 WALL_ID = 2
 
-# Door state mapping
 DOOR_STATES = {0: "open", 1: "closed", 2: "locked"}
 
-# Agent's fixed position in the egocentric 7×7 grid
+# Agent is always at bottom-center of the 7x7 egocentric grid
 AGENT_X = 3
 AGENT_Y = 6
 
 
-# ──────────────────────────────────────────────
-# Main Parser
-# ──────────────────────────────────────────────
-
 def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
     """
-    Convert a MiniGrid egocentric observation into a JSON string.
+    Parse the 7x7x3 observation grid into a JSON string.
 
-    Parameters
-    ----------
-    image_array : np.ndarray, shape (7, 7, 3)
-        The agent's partial view. Indexed as [x, y, channel].
-    carrying_obj : minigrid WorldObj or None
-        The object the agent is currently carrying.
-
-    Returns
-    -------
-    str
-        A JSON string with keys: inventory, boundaries, entities.
+    image_array: shape (7,7,3), indexed as [x, y, channel]
+    carrying_obj: env.carrying object or None
+    Returns: JSON string with inventory, boundaries, and entities.
     """
 
-    # ── Step 1: Parse Inventory ──
+    # -- Inventory --
     if carrying_obj is not None:
         inv_str = f"{carrying_obj.color} {carrying_obj.type}"
     else:
         inv_str = "empty"
 
-    # ── Step 2: Detect Room Boundaries (Ray Casting) ──
+    # -- Boundary detection via ray casting --
+    # Cast rays from agent position to find nearest wall in each direction
 
-    # Forward: from agent (y=6), cast ray upward along x=3
+    # Forward: scan upward from agent along x=3
     bound_fwd = "unknown"
     for y in range(5, -1, -1):
         if int(image_array[3, y, 0]) == WALL_ID:
@@ -73,7 +51,7 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
             bound_fwd = f"{steps} step{'s' if steps != 1 else ''}"
             break
 
-    # Left: from agent (x=3), cast ray leftward along y=6
+    # Left: scan leftward from agent along y=6
     bound_left = "unknown"
     for x in range(2, -1, -1):
         if int(image_array[x, 6, 0]) == WALL_ID:
@@ -81,7 +59,7 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
             bound_left = f"{steps} step{'s' if steps != 1 else ''}"
             break
 
-    # Right: from agent (x=3), cast ray rightward along y=6
+    # Right: scan rightward from agent along y=6
     bound_right = "unknown"
     for x in range(4, 7):
         if int(image_array[x, 6, 0]) == WALL_ID:
@@ -89,7 +67,8 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
             bound_right = f"{steps} step{'s' if steps != 1 else ''}"
             break
 
-    # ── Step 3: Extract Actionable Entities ──
+    # -- Actionable entities --
+    # Scan grid for anything that isn't wall/floor/empty/unseen
     entities_list = []
 
     for x in range(7):
@@ -98,15 +77,11 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
             color_id = int(image_array[x, y, 1])
             state_id = int(image_array[x, y, 2])
 
-            # Skip non-actionable tiles
             if obj_id in IGNORE_IDS:
                 continue
-
-            # Skip agent's own tile
             if x == AGENT_X and y == AGENT_Y:
                 continue
 
-            # Object semantics
             obj_name = IDX_TO_OBJECT.get(obj_id, f"unknown({obj_id})")
             color_name = IDX_TO_COLOR.get(color_id, f"unknown({color_id})")
 
@@ -116,7 +91,7 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
             else:
                 entity_string = f"{color_name} {obj_name}"
 
-            # Spatial distances
+            # relative position from agent
             forward_steps = AGENT_Y - y
             lateral_steps = x - AGENT_X
 
@@ -127,7 +102,7 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
                 "location": location_string,
             })
 
-    # ── Step 4: JSON Assembly ──
+    # -- Assemble JSON --
     result = {
         "inventory": inv_str,
         "boundaries": {
@@ -141,8 +116,8 @@ def parse_env_description(image_array: np.ndarray, carrying_obj) -> str:
     return json.dumps(result)
 
 
-def _build_location_string(forward_steps: int, lateral_steps: int) -> str:
-    """Build a human-readable relative location string."""
+def _build_location_string(forward_steps, lateral_steps):
+    """Turn (forward, lateral) distances into a readable string like '2 steps forward, 1 step left'."""
     parts = []
 
     if forward_steps > 0:
@@ -167,9 +142,7 @@ def _build_location_string(forward_steps: int, lateral_steps: int) -> str:
     return ", ".join(parts)
 
 
-# ──────────────────────────────────────────────
-# Self-Test
-# ──────────────────────────────────────────────
+# --- Quick self-test ---
 
 if __name__ == "__main__":
     import gymnasium as gym

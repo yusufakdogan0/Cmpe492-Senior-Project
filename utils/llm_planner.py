@@ -35,18 +35,17 @@ You receive a JSON observation of your egocentric view and must generate the nex
 ## Allowed Subgoals
 Your output must be one of these action forms:
 - Subgoal: explore<end>
-- Subgoal: go to the [color] [object/door/goal]<end>
-- Subgoal: pickup the [color] [object]<end>
-- Subgoal: drop the [color] [object]<end>
-- Subgoal: open the [color] door<end>
-- Subgoal: close the [color] door<end>
-- Subgoal: search for the [color] [object]<end>
+- Subgoal: go to the [status?] [color] [object/door]<end>
+- Subgoal: pickup/drop the [color] [object]<end>
+- Subgoal: open/close the [status] [color] door<end>
+- Subgoal: search for the [status?] [color] [object/door]<end>
 
 ## System Rules
 1. You can only interact with entities listed in the JSON. Do not hallucinate objects.
 2. If your path is blocked by a locked door, you must hold a matching key before you can open it.
 3. If no actionable entities are visible to achieve the mission, your subgoal must be to explore.
 4. Output strictly in this format: Subgoal: <action><end>
+5. [status?] means status is optional (keys, balls have no state). [status] means required (doors are always open, closed, or locked).
 
 --- Example 1: Empty View & No Past Subgoals ---
 Mission: open the purple door
@@ -67,7 +66,7 @@ Mission: pick up the green ball
 Direction: south
 Environment: {"inventory": "purple key", "boundaries": {"forward": "1 step", "left": "unknown", "right": "unknown"}, "entities": [{"entity": "locked purple door", "location": "1 step forward"}]}
 Past Subgoals: pickup the purple key
-Output: Subgoal: open the purple door<end>"""
+Output: Subgoal: open the locked purple door<end>"""
 
 # Maps MiniGrid direction indices to readable names
 IDX_TO_DIRECTION = {0: "east", 1: "south", 2: "west", 3: "north"}

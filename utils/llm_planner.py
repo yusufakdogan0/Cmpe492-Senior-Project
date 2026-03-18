@@ -1,30 +1,20 @@
 """
-llm_planner.py — Subgoal generation via local LLM (Ollama + Qwen 2.5 7B).
+Subgoal generation via a local LLM (Ollama + Qwen 2.5 7B).
 
-Sends the parsed environment JSON and mission string to Qwen through
-Ollama's HTTP API. Uses few-shot examples to keep the model on track
-and regex to extract the subgoal from the response.
+Sends the parsed environment JSON, mission, direction, and subgoal
+history to Qwen through Ollama's HTTP API.  Few-shot examples anchor
+the model's output format; a regex extracts the subgoal string.
 
-Usage:
-    from utils.llm_planner import LLMPlanner
-
-    planner = LLMPlanner()
-    subgoal = planner.get_subgoal(
-        mission="open the purple door",
-        env_json_str=env_json,
-        direction=obs["direction"],
-        past_subgoals=["pickup the purple key"],
-    )
+This is the primary planner used during both training and evaluation.
+Falls back to ``"explore"`` on network errors or parse failures so
+training can continue even if the LLM is temporarily unreachable.
 """
+
+from __future__ import annotations
 
 import re
 import json
 import requests
-
-
-# --- Few-shot prompt ---
-# This is the full prompt sent to the LLM. The few-shot examples
-# teach it to output in the exact format we need.
 
 SYSTEM_PROMPT = """\
 ## Task
@@ -68,21 +58,20 @@ Environment: {"inventory": "purple key", "boundaries": {"forward": "1 step", "le
 Past Subgoals: pickup the purple key
 Output: Subgoal: open the locked purple door<end>"""
 
-# Maps MiniGrid direction indices to readable names
 IDX_TO_DIRECTION = {0: "east", 1: "south", 2: "west", 3: "north"}
 
-# Regex to pull out the subgoal text between "Subgoal:" and "<end>"
 SUBGOAL_PATTERN = re.compile(r"Subgoal:\s*(.*?)<end>", re.IGNORECASE | re.DOTALL)
 
 
 class LLMPlanner:
     """
-    Queries a local Ollama server to get the next subgoal for the RL agent.
+    Queries a local Ollama server to generate the next subgoal.
 
-    By default uses Qwen 2.5 7B (4-bit). The model runs locally.
+    Default model: Qwen 2.5 7B (4-bit quantised via Ollama).
+    Falls back to ``"explore"`` on network errors or parse failures.
     """
 
-    def __init__(self, model_name="qwen2.5:7b", host="http://localhost:11434"):
+    def __init__(self, model_name: str = "qwen2.5:7b", host: str = "http://localhost:11434"):
         self.model_name = model_name
         self.url = f"{host}/api/generate"
 
@@ -93,33 +82,14 @@ class LLMPlanner:
         direction: int | str,
         past_subgoals: list[str],
     ) -> str:
-        """
-        Generate the next subgoal given the current state.
-
-        Args:
-            mission: environment mission string
-            env_json_str: JSON from parse_env_description()
-            direction: agent facing direction (int 0-3 or string)
-            past_subgoals: list of previously completed subgoals
-
-        Returns:
-            Cleaned subgoal string, e.g. "pickup the yellow key"
-        """
-
-        # convert direction index to name if needed
         if isinstance(direction, int):
             dir_str = IDX_TO_DIRECTION.get(direction, "unknown")
         else:
             dir_str = direction
 
-        # Format past subgoals
-        if past_subgoals:
-            past_str = ", ".join(past_subgoals)
-        else:
-            past_str = "None"
+        past_str = ", ".join(past_subgoals) if past_subgoals else "None"
 
-        # Construct final prompt
-        final_prompt = (
+        prompt = (
             f"{SYSTEM_PROMPT}\n\n"
             f"--- Current Task ---\n"
             f"Mission: {mission}\n"
@@ -131,12 +101,9 @@ class LLMPlanner:
 
         payload = {
             "model": self.model_name,
-            "prompt": final_prompt,
+            "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": 0.0,   # no randomness — we want deterministic plans
-                "num_predict": 30,    # short cap since we only need "Subgoal: ...<end>"
-            },
+            "options": {"temperature": 0.0, "num_predict": 30},
         }
 
         try:
@@ -144,68 +111,53 @@ class LLMPlanner:
             response.raise_for_status()
             raw_text = response.json()["response"]
         except requests.Timeout:
-            print("[LLMPlanner] Ollama timed out (>10s), defaulting to 'explore'")
+            print("[LLMPlanner] Ollama timed out, defaulting to 'explore'")
             return "explore"
         except (requests.RequestException, KeyError) as e:
             print(f"[LLMPlanner] request failed: {e}")
             return "explore"
 
-        # Extract subgoal with regex
         return self._parse_subgoal(raw_text)
 
     @staticmethod
-    def _parse_subgoal(raw_text):
-        """Try to extract the subgoal via regex. If it fails, log the raw output and fall back."""
+    def _parse_subgoal(raw_text: str) -> str:
         match = SUBGOAL_PATTERN.search(raw_text)
         if match:
             return match.group(1).strip()
 
-        # regex didn't match — print what the model actually said so we can debug
-        print(f"[LLMPlanner] regex miss, raw output:")
-        print(f"  >>> {repr(raw_text[:200])}")
+        print(f"[LLMPlanner] regex miss: {repr(raw_text[:200])}")
         cleaned = raw_text.strip().split("\n")[-1].strip()
-        if cleaned:
-            return cleaned
-
-        return "explore"
+        return cleaned if cleaned else "explore"
 
 
-# --- Quick self-test ---
+# -- self-test -----------------------------------------------------------
 
 if __name__ == "__main__":
     import sys, os, time
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     import gymnasium as gym
-    import minigrid
+    import minigrid  # noqa: F401
     from utils.env_parser import parse_env_description
 
     planner = LLMPlanner()
     env = gym.make("MiniGrid-DoorKey-5x5-v0")
 
     print("=" * 60)
-    print("  LLMPlanner — Self-Test")
+    print("  LLMPlanner -- Self-Test")
     print("=" * 60)
 
     for seed in range(3):
         obs, _ = env.reset(seed=seed)
         env_json = parse_env_description(obs["image"], env.unwrapped.carrying)
-        mission = obs["mission"]
-        direction = obs["direction"]
-
-        print(f"\n--- Seed {seed} ---")
-        print(f"Mission  : {mission}")
-        print(f"Direction: {IDX_TO_DIRECTION[direction]}")
-        print(f"Env JSON : {env_json}")
 
         start = time.time()
-        subgoal = planner.get_subgoal(mission, env_json, direction, past_subgoals=[])
+        subgoal = planner.get_subgoal(
+            obs["mission"], env_json, obs["direction"], past_subgoals=[]
+        )
         elapsed = time.time() - start
+        print(f"Seed {seed} | {subgoal}  ({elapsed:.1f}s)")
 
-        print(f"Subgoal  : {subgoal}  ({elapsed:.1f}s)")
-
-    # test with past subgoals
-    print(f"\n--- With past subgoals ---")
     obs, _ = env.reset(seed=0)
     env_json = parse_env_description(obs["image"], env.unwrapped.carrying)
     start = time.time()
@@ -214,10 +166,8 @@ if __name__ == "__main__":
         past_subgoals=["pickup the yellow key"],
     )
     elapsed = time.time() - start
-    print(f"Subgoal  : {subgoal}  ({elapsed:.1f}s)")
+    print(f"With history | {subgoal}  ({elapsed:.1f}s)")
 
-    # edge case: nothing visible, should return "explore"
-    print(f"\n--- Empty entities (explore test) ---")
     empty_json = json.dumps({
         "inventory": "empty",
         "boundaries": {"forward": "1 step", "left": "1 step", "right": "1 step"},
@@ -229,8 +179,6 @@ if __name__ == "__main__":
         empty_json, "east", past_subgoals=[],
     )
     elapsed = time.time() - start
-    print(f"Subgoal  : {subgoal}  ({elapsed:.1f}s)")
+    print(f"Empty view   | {subgoal}  ({elapsed:.1f}s)")
 
-    print("\n" + "=" * 60)
-    print("  Done.")
     print("=" * 60)

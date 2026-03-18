@@ -1,136 +1,99 @@
 """
-subgoal_tracker.py — Verifies whether an LLM-generated subgoal has been achieved.
+Subgoal completion verification for MiniGrid environments.
 
-Action-aware checking: instead of scanning the entire grid, we check
-what just happened at the agent's position after each step.
-
-- open/close: only triggers if agent just toggled (action 5) the matching door
-- pickup/drop: checks env.carrying
-- go to: checks if target is at front_pos
-- search/explore: checks if target entity appears in current 7x7 view
+Uses action-aware checking to distinguish agent-caused state changes
+from pre-existing states (e.g. "agent opened this door" vs "door was
+already open"). Each checker inspects the environment after the step
+and the action that was just taken.
 """
 
 import numpy as np
 from minigrid.core.constants import IDX_TO_OBJECT, IDX_TO_COLOR
 
-# tiles that aren't real objects (skip during observation scans)
 NON_ACTIONABLE_IDS = {0, 1, 2, 3}  # unseen, empty, wall, floor
-
-# MiniGrid action constants
 ACTION_TOGGLE = 5
+KNOWN_COLORS = {"red", "green", "blue", "purple", "yellow", "grey"}
+KNOWN_TYPES = {"key", "door", "ball", "box", "goal"}
 
 
 class SubgoalTracker:
     """
-    Checks if the agent has completed its current subgoal.
-    Requires the action taken at each step so we can distinguish
-    "the agent opened this door" from "a door was already open".
+    Stateless verifier for LLM-generated subgoals.
+
+    Each call to ``check_completion`` examines the unwrapped MiniGrid env
+    and the action just taken to determine whether a subgoal string
+    (e.g. "pickup the yellow key") has been satisfied.
     """
 
-    def check_completion(self, subgoal, env, action) -> bool:
-        """
-        Check if the given subgoal was achieved by the last action.
+    def reset(self):
+        """Reset any per-episode state. Currently a no-op (tracker is stateless)."""
+        pass
 
-        Args:
-            subgoal: e.g. "pickup the yellow key", "open the locked red door"
-            env: the unwrapped MiniGrid environment (after the step)
-            action: the integer action the agent just took (0-6)
-
-        Returns True if the subgoal is completed.
-        """
+    def check_completion(self, subgoal: str, env, action: int) -> bool:
+        """Return True if *subgoal* was achieved by the agent's last *action*."""
         subgoal = subgoal.lower().strip()
 
         if subgoal.startswith("pickup"):
             return self._check_pickup(subgoal, env)
-        elif subgoal.startswith("open"):
+        if subgoal.startswith("open"):
             return self._check_open(subgoal, env, action)
-        elif subgoal.startswith("close"):
+        if subgoal.startswith("close"):
             return self._check_close(subgoal, env, action)
-        elif subgoal.startswith("go to"):
+        if subgoal.startswith("go to"):
             return self._check_go_to(subgoal, env)
-        elif subgoal.startswith("drop"):
+        if subgoal.startswith("drop"):
             return self._check_drop(subgoal, env)
-        elif subgoal in ("explore",) or subgoal.startswith("search for"):
+        if subgoal == "explore" or subgoal.startswith("search for"):
             return self._check_search(subgoal, env)
-        else:
-            return False
+        return False
 
-    # --- Individual checkers ---
+    # -- checkers --------------------------------------------------------
 
     def _check_pickup(self, subgoal, env):
-        """'pickup the yellow key' → True if agent is now carrying a yellow key."""
         color, obj_type = self._extract_color_and_type(subgoal)
         if env.carrying is None:
             return False
         return env.carrying.color == color and env.carrying.type == obj_type
 
     def _check_open(self, subgoal, env, action):
-        """
-        'open the locked red door' → True if agent just toggled (action 5)
-        and the door in front of it is red and now open.
-
-        This prevents false positives from doors that were already open
-        elsewhere on the map.
-        """
+        """Only fires when the agent just toggled (action 5) the matching door."""
         if action != ACTION_TOGGLE:
             return False
-
         color, _ = self._extract_color_and_type(subgoal)
         fwd_cell = env.grid.get(*env.front_pos)
-
         if fwd_cell is None or fwd_cell.type != "door":
             return False
-
         return fwd_cell.color == color and fwd_cell.is_open
 
     def _check_close(self, subgoal, env, action):
-        """'close the open red door' → True if agent just toggled and door is now closed."""
         if action != ACTION_TOGGLE:
             return False
-
         color, _ = self._extract_color_and_type(subgoal)
         fwd_cell = env.grid.get(*env.front_pos)
-
         if fwd_cell is None or fwd_cell.type != "door":
             return False
-
         return fwd_cell.color == color and not fwd_cell.is_open
 
     def _check_go_to(self, subgoal, env):
-        """
-        'go to the yellow key' → True if the target object is directly
-        in front of the agent (1 step forward, 0 lateral).
-        """
+        """True when the target object is directly in front of the agent."""
         color, obj_type = self._extract_color_and_type(subgoal)
         fwd_cell = env.grid.get(*env.front_pos)
-
         if fwd_cell is None:
             return False
-
         return fwd_cell.color == color and fwd_cell.type == obj_type
 
     def _check_drop(self, subgoal, env):
-        """'drop the yellow key' → True if agent is no longer carrying it."""
         color, obj_type = self._extract_color_and_type(subgoal)
         if env.carrying is None:
             return True
-        # still carrying the same thing → not dropped
         if env.carrying.color == color and env.carrying.type == obj_type:
             return False
         return True
 
     def _check_search(self, subgoal, env):
-        """
-        'explore' → True if any actionable entity is visible in the 7x7 view.
-        'search for the purple key' → True if that specific entity is visible.
-
-        Scans the current observation directly — no memory of past views needed
-        since this is checked every step. The subgoal stays active until
-        the target is found.
-        """
+        """'explore' succeeds on any visible entity; 'search for X' requires X."""
         image = env.gen_obs()["image"]
-        visible_entities = set()
-
+        visible = set()
         for x in range(7):
             for y in range(7):
                 obj_id = int(image[x, y, 0])
@@ -139,45 +102,30 @@ class SubgoalTracker:
                 color_id = int(image[x, y, 1])
                 obj_name = IDX_TO_OBJECT.get(obj_id, "unknown")
                 color_name = IDX_TO_COLOR.get(color_id, "unknown")
-                visible_entities.add(f"{color_name} {obj_name}")
+                visible.add(f"{color_name} {obj_name}")
 
         if subgoal.startswith("search for"):
-            # only succeed if the specific target is visible
-            target_color, target_type = self._extract_color_and_type(subgoal)
-            return f"{target_color} {target_type}" in visible_entities
+            tc, tt = self._extract_color_and_type(subgoal)
+            return f"{tc} {tt}" in visible
+        return len(visible) > 0
 
-        # plain "explore" — any actionable entity in view counts
-        return len(visible_entities) > 0
-
-    # --- String parsing helpers ---
+    # -- parsing helpers -------------------------------------------------
 
     @staticmethod
-    def _extract_color(subgoal):
-        """Pull the color word from a subgoal string."""
-        known_colors = {"red", "green", "blue", "purple", "yellow", "grey"}
-        for word in subgoal.split():
-            if word in known_colors:
+    def _extract_color(text):
+        for word in text.split():
+            if word in KNOWN_COLORS:
                 return word
         return ""
 
     @staticmethod
-    def _extract_color_and_type(subgoal):
-        """
-        Pull color and object type from a subgoal string.
-        e.g. 'pickup the yellow key' → ('yellow', 'key')
-        e.g. 'open the locked red door' → ('red', 'door')
-        """
-        known_colors = {"red", "green", "blue", "purple", "yellow", "grey"}
-        known_types = {"key", "door", "ball", "box", "goal"}
-
-        color = ""
-        obj_type = ""
-        for word in subgoal.split():
-            if word in known_colors:
+    def _extract_color_and_type(text):
+        color, obj_type = "", ""
+        for word in text.split():
+            if word in KNOWN_COLORS:
                 color = word
-            if word in known_types:
+            if word in KNOWN_TYPES:
                 obj_type = word
-
         return color, obj_type
 
 

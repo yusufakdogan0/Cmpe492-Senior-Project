@@ -1,66 +1,100 @@
 # An Experimental Evaluation of LLM-Assisted Hierarchical Reinforcement Learning
 
-This repository contains the codebase for our CMPE 492 Senior Project at Boğaziçi University. This project focuses on implementing, adapting, and evaluating LLM-assisted hierarchical reinforcement learning architectures. 
+This repository contains the codebase for our CMPE 492 Senior Project at Bogazici University. We implement and evaluate an LLM-assisted hierarchical reinforcement learning architecture where a large language model decomposes high-level missions into subgoals that guide a PPO agent's exploration and decision-making in interactive grid-world environments.
 
-We explore how Large Language Models can effectively decompose high-level missions into manageable subgoals to guide a PPO agent's exploration and decision-making in interactive environments.
+**Team:** Onur Kucuk & Yusuf Akdogan
+**Advisor:** Emre Ugur
 
-**Team:** Onur Küçük & Yusuf Akdoğan  
-**Advisor:** Emre Uğur  
+## Documentation
 
-## Project Documentation
-All official project documentation, including our timeline, milestones, and methodology, is maintained in the [Repository Wiki](https://github.com/yusufakdogan0/Cmpe492-Senior-Project/wiki).
+Official project documentation, timeline, and milestones are in the [Repository Wiki](https://github.com/yusufakdogan0/Cmpe492-Senior-Project/wiki).
 
 ## Project Structure
 
 ```
 492proj/
-├── models/                     # Neural network architectures
+├── models/
 │   ├── __init__.py
-│   └── baseline_agent.py       # Recurrent actor-critic (ConvNet+LSTM / Embedding+GRU)
-├── scripts/                    # Training & evaluation entry points
-│   └── train_baseline.py       # PPO training loop with CSV logging & plotting
-├── utils/                      # Shared utilities for LLM integration
+│   ├── baseline_agent.py       # Recurrent actor-critic (mission-only baseline)
+│   └── lgrl_agent.py           # LGRL actor-critic (mission + subgoal via [SEP])
+├── scripts/
+│   ├── train_baseline.py       # Baseline PPO training (no subgoal guidance)
+│   └── train_lgrl.py           # LGRL training with LLM-guided subgoals
+├── utils/
 │   ├── __init__.py
-│   ├── env_parser.py           # MiniGrid observation → JSON for the LLM
-│   └── llm_planner.py          # LLM-based subgoal generation via Ollama
+│   ├── env_parser.py           # MiniGrid 7x7 observation -> JSON for the LLM
+│   ├── llm_planner.py          # LLM subgoal generation (Ollama / Qwen 2.5 7B)
+│   ├── rule_based_planner.py   # Oracle ablation baseline (deterministic subgoals)
+│   └── subgoal_tracker.py      # Subgoal completion verification
 ├── checkpoints/                # Saved model weights (git-ignored)
-├── logs/                       # Training metrics & plots (git-ignored)
-├── requirements.txt            # Python dependencies
+├── logs/                       # Metrics CSV & plots (git-ignored)
+├── requirements.txt
 └── .gitignore
 ```
 
-## Environment Setup
+## Setup
 
-**Prerequisites:** Python 3.13, NVIDIA GPU with CUDA support, [Ollama](https://ollama.com/download) (for LLM inference).
+**Prerequisites:** Python 3.13, NVIDIA GPU with CUDA support, [Ollama](https://ollama.com/download).
 
 ```bash
-# 1. Create and activate a virtual environment
 python -m venv venv
-# Windows:
-venv\Scripts\activate
-# macOS/Linux:
-# source venv/bin/activate
+venv\Scripts\activate            # Windows
+# source venv/bin/activate       # macOS / Linux
 
-# 2. Install PyTorch with CUDA support
 pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-
-# 3. Install remaining dependencies
 pip install -r requirements.txt
 
-# 4. Pull the LLM model (Qwen 2.5 7B, 4-bit quantized)
 ollama pull qwen2.5:7b
 ```
+
+## Training
+
+### Baseline (no subgoal guidance)
+
+Standard PPO agent conditioned only on the mission string. Used as the control condition.
+
+```bash
+python scripts/train_baseline.py
+```
+
+### LGRL with LLM planner (default)
+
+The LLM (Qwen 2.5 7B via Ollama) generates subgoals at each decision point during training. Requires the Ollama server running on `localhost:11434`.
+
+```bash
+python scripts/train_lgrl.py
+```
+
+### LGRL with rule-based oracle (ablation)
+
+A deterministic planner that produces perfect subgoals using hand-coded heuristics. Useful for isolating the effect of LLM guidance from the reward scaffolding.
+
+```bash
+python scripts/train_lgrl.py --planner rule_based
+```
+
+## Architecture
+
+The agent operates in a bi-level hierarchy:
+
+- **High level:** A planner (LLM or rule-based oracle) observes the environment state as a JSON description and generates the next subgoal (e.g. "pickup the yellow key").
+- **Low level:** A recurrent PPO agent receives the concatenated text `"mission [SEP] subgoal"` alongside the visual observation and selects low-level actions.
+
+### Reward Scaffolding
+
+| Symbol | Formula | Value |
+|--------|---------|-------|
+| Mission reward | `r_m = R_m * (1 - 0.5 * T_used / T_max)` | R_m = 0.5 |
+| Subgoal reward | `r_i = R_t * (1 - 0.5 * T_used / T_i)` | R_t = 0.5 |
+| Subgoal budget | `T_i = (i / n) * T_max` | n = 5, T_max = 100 |
+| Episode total  | `r = r_m + (1/n) * sum(r_i)` | |
 
 ## Tech Stack
 
 | Package | Version | Purpose |
-|---|---|---|
+|---------|---------|---------|
 | PyTorch | 2.6.0 (CUDA 12.4) | Deep learning framework |
 | torch-ac | 1.4.0 | Actor-critic RL algorithms (PPO) |
 | MiniGrid | latest | Grid-world environments |
 | Gymnasium | latest | Environment interface |
-| NumPy | latest | Numerical computing |
-| Matplotlib | latest | Training curve visualization |
-| Requests | latest | HTTP client for Ollama API |
-| Ollama | 0.17+ | Local LLM inference server |
-| Qwen 2.5 7B | q4_K_M | LLM for subgoal generation |
+| Ollama + Qwen 2.5 7B | q4_K_M | Local LLM inference |

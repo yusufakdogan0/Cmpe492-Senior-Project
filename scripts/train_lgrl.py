@@ -19,10 +19,12 @@ Reward scaffolding:
 Usage:
     python scripts/train_lgrl.py                     # LLM planner (default)
     python scripts/train_lgrl.py --planner rule_based  # oracle ablation
+    python scripts/train_lgrl.py --resume              # resume from checkpoint
 """
 
 import argparse
 import csv
+import json
 import os
 import sys
 import time
@@ -40,6 +42,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 import torch_ac
+import torch_ac.algos.base
+from utils.sequential_env import SequentialEnv
+torch_ac.algos.base.ParallelEnv = SequentialEnv
 
 from models.baseline_agent import Vocabulary
 from models.lgrl_agent import LGRLAgent
@@ -99,6 +104,18 @@ def parse_args():
         help="Subgoal generation strategy. 'llm' queries Qwen via Ollama "
              "(default). 'rule_based' uses a deterministic oracle for ablation.",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from the latest checkpoint (loads model, "
+             "optimizer, counters and appends to the existing CSV).",
+    )
+    parser.add_argument(
+        "--subgoal-log",
+        action="store_true",
+        default=False,
+        help="Enable per-subgoal JSONL logging to logs/subgoal_log.jsonl.",
+    )
     return parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -129,7 +146,7 @@ class HierarchyState:
         self.episode_steps[env_idx]   = 0
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """Paper Eq. 6: T_i = (i / n) * T_max."""
+        """T_i = (i / n) * T_max -- progressive budget that grows with subgoal index."""
         i = self.subgoal_indices[env_idx]
         return (i / N_SUBGOALS_EST) * MAX_ENV_STEPS
 
@@ -173,7 +190,7 @@ def make_env(env_name: str, seed: int):
 # Reward shaping
 # ---------------------------------------------------------------------------
 
-def make_reshape_reward(hierarchy_state, planner, envs):
+def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
     """
     Build the ``reshape_reward`` callback consumed by ``torch_ac.PPOAlgo``.
 
@@ -189,9 +206,19 @@ def make_reshape_reward(hierarchy_state, planner, envs):
         hierarchy_state.step_counters[env_idx] += 1
         hierarchy_state.episode_steps[env_idx] += 1
 
+        if done:
+            if reward > 0:
+                t_total = hierarchy_state.episode_steps[env_idx]
+                ratio = min(t_total / MAX_ENV_STEPS, 1.0)
+                total_reward += R_MISSION * (1.0 - 0.5 * ratio)
+            hierarchy_state.reset_env(env_idx)
+            return total_reward
+
         uw = envs[env_idx].unwrapped
         subgoal = hierarchy_state.active_subgoals[env_idx]
-        completed = hierarchy_state.trackers[env_idx].check_completion(subgoal, uw, action)
+        completed = hierarchy_state.trackers[env_idx].check_completion(
+            subgoal, uw, action, obs_image=obs["image"],
+        )
 
         t_used = hierarchy_state.step_counters[env_idx]
         t_budget = hierarchy_state.subgoal_budget(env_idx)
@@ -205,20 +232,21 @@ def make_reshape_reward(hierarchy_state, planner, envs):
             hierarchy_state.histories[env_idx].append(
                 {"subgoal": subgoal, "status": "Success", "steps": t_used}
             )
-            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner)
+            _log_subgoal_event(subgoal_log, env_idx, "completed",
+                               obs.get("mission", ""), subgoal,
+                               t_used, t_budget, r_i / N_SUBGOALS_EST)
+            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
+                             subgoal_log)
 
         elif timed_out:
             hierarchy_state.histories[env_idx].append(
                 {"subgoal": subgoal, "status": "Failed", "steps": t_used}
             )
-            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner)
-
-        if done:
-            if reward > 0:
-                t_total = hierarchy_state.episode_steps[env_idx]
-                ratio = min(t_total / MAX_ENV_STEPS, 1.0)
-                total_reward += R_MISSION * (1.0 - 0.5 * ratio)
-            hierarchy_state.reset_env(env_idx)
+            _log_subgoal_event(subgoal_log, env_idx, "timed_out",
+                               obs.get("mission", ""), subgoal,
+                               t_used, t_budget, 0.0)
+            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
+                             subgoal_log)
 
         return total_reward
 
@@ -226,7 +254,32 @@ def make_reshape_reward(hierarchy_state, planner, envs):
     return reshape_reward
 
 
-def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner):
+def _log_subgoal_event(log_file, env_idx, event, mission, subgoal,
+                       steps_used, budget, reward_given,
+                       env_state=None, raw_llm=None):
+    """Write a single JSON line to the subgoal log."""
+    if log_file is None:
+        return
+    entry = {
+        "env": env_idx,
+        "event": event,
+        "mission": mission,
+        "subgoal": subgoal,
+        "valid": SubgoalTracker.is_recognized(subgoal),
+        "steps_used": steps_used,
+        "budget": round(budget, 1),
+        "reward": round(reward_given, 6),
+    }
+    if env_state is not None:
+        entry["env_state"] = env_state
+    if raw_llm is not None:
+        entry["raw_llm_response"] = raw_llm
+    log_file.write(json.dumps(entry) + "\n")
+    log_file.flush()
+
+
+def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
+                     subgoal_log=None):
     """Query the planner for a new subgoal and advance the index."""
     env_json = parse_env_description(obs["image"], uw.carrying)
     direction = obs.get("direction", 0)
@@ -234,9 +287,16 @@ def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner):
 
     new_subgoal = planner.get_subgoal(obs["mission"], env_json, direction, past)
 
+    raw_llm = getattr(planner, "last_raw_response", None)
+
     hierarchy_state.active_subgoals[env_idx] = new_subgoal
     hierarchy_state.step_counters[env_idx] = 0
     hierarchy_state.subgoal_indices[env_idx] += 1
+
+    _log_subgoal_event(subgoal_log, env_idx, "new",
+                       obs.get("mission", ""), new_subgoal,
+                       0, hierarchy_state.subgoal_budget(env_idx), 0.0,
+                       env_state=env_json, raw_llm=raw_llm)
 
 # ---------------------------------------------------------------------------
 # Plotting
@@ -291,6 +351,37 @@ def save_plots(history, plot_dir, planner_tag):
     plt.close(fig)
 
 # ---------------------------------------------------------------------------
+# Checkpointing
+# ---------------------------------------------------------------------------
+
+def _save_checkpoint(path, model, algo, vocab, update, total_frames, planner_tag):
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": algo.optimizer.state_dict(),
+            "vocab": vocab.word2idx,
+            "update": update,
+            "total_frames": total_frames,
+            "planner": planner_tag,
+        },
+        path,
+    )
+
+
+def _load_history_from_csv(csv_path, csv_fields):
+    """Re-read an existing metrics CSV into the history dict for plotting continuity."""
+    history = {k: [] for k in csv_fields}
+    if not os.path.exists(csv_path):
+        return history
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for k in csv_fields:
+                history[k].append(float(row[k]))
+    return history
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -335,8 +426,12 @@ def main():
     else:
         planner = RuleBasedPlanner()
 
+    subgoal_log_path = os.path.join(LOG_DIR, "subgoal_log.jsonl")
+    subgoal_log = open(subgoal_log_path, "a", encoding="utf-8") if args.subgoal_log else None
+
     preprocess_obss = make_preprocess_obss(vocab, hierarchy_state, device=DEVICE)
-    reshape_reward = make_reshape_reward(hierarchy_state, planner, envs)
+    reshape_reward = make_reshape_reward(hierarchy_state, planner, envs,
+                                         subgoal_log=subgoal_log)
 
     algo = torch_ac.PPOAlgo(
         envs=envs,
@@ -370,12 +465,28 @@ def main():
         "update", "frames", "avg_return", "avg_steps",
         "entropy", "policy_loss", "value_loss", "elapsed_sec",
     ]
-    csv_file = open(csv_path, "w", newline="")
-    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
-    csv_writer.writeheader()
-    history = {k: [] for k in csv_fields}
+
+    if args.resume and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+        model.load_state_dict(ckpt["model_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            algo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        update = ckpt.get("update", 0)
+        total_frames = ckpt.get("total_frames", 0)
+        print(f"  Resumed from checkpoint: update={update}, frames={total_frames:,}")
+
+        history = _load_history_from_csv(csv_path, csv_fields)
+        csv_file = open(csv_path, "a", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+    else:
+        history = {k: [] for k in csv_fields}
+        csv_file = open(csv_path, "w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+        csv_writer.writeheader()
 
     print(f"\n  Logging to : {csv_path}")
+    if subgoal_log is not None:
+        print(f"  Subgoal log: {subgoal_log_path}")
     print(f"  Plots      : {PLOT_DIR}")
     print(
         f"\n{'Update':>7} | {'Frames':>10} | {'Avg Return':>11} | {'Avg Steps':>10} | "
@@ -420,36 +531,24 @@ def main():
             history[k].append(float(v))
 
         if update % CHECKPOINT_EVERY == 0:
-            torch.save(
-                {
-                    "model_state_dict": model.state_dict(),
-                    "vocab": vocab.word2idx,
-                    "update": update,
-                    "total_frames": total_frames,
-                    "planner": planner_tag,
-                },
-                checkpoint_path,
-            )
+            _save_checkpoint(checkpoint_path, model, algo, vocab,
+                             update, total_frames, planner_tag)
 
         if update % PLOT_EVERY == 0:
             save_plots(history, PLOT_DIR, planner_tag)
 
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "vocab": vocab.word2idx,
-            "update": update,
-            "total_frames": total_frames,
-            "planner": planner_tag,
-        },
-        checkpoint_path,
-    )
+    _save_checkpoint(checkpoint_path, model, algo, vocab,
+                     update, total_frames, planner_tag)
     csv_file.close()
+    if subgoal_log is not None:
+        subgoal_log.close()
     save_plots(history, PLOT_DIR, planner_tag)
 
     print(f"\nTraining complete.")
     print(f"  Checkpoint : {checkpoint_path}")
     print(f"  Metrics    : {csv_path}")
+    if subgoal_log is not None:
+        print(f"  Subgoal log: {subgoal_log_path}")
     print(f"  Plots      : {PLOT_DIR}")
     print(f"  Updates: {update}, Frames: {total_frames:,}")
 

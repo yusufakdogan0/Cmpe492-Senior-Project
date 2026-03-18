@@ -25,12 +25,29 @@ class SubgoalTracker:
     (e.g. "pickup the yellow key") has been satisfied.
     """
 
+    RECOGNIZED_PREFIXES = ("pickup", "open", "close", "go to", "drop", "search for")
+
     def reset(self):
         """Reset any per-episode state. Currently a no-op (tracker is stateless)."""
         pass
 
-    def check_completion(self, subgoal: str, env, action: int) -> bool:
-        """Return True if *subgoal* was achieved by the agent's last *action*."""
+    @classmethod
+    def is_recognized(cls, subgoal: str) -> bool:
+        """Return True if *subgoal* matches a format that ``check_completion`` can evaluate."""
+        s = subgoal.lower().strip()
+        return s == "explore" or any(s.startswith(p) for p in cls.RECOGNIZED_PREFIXES)
+
+    def check_completion(
+        self, subgoal: str, env, action: int, *, obs_image=None,
+    ) -> bool:
+        """Return True if *subgoal* was achieved by the agent's last *action*.
+
+        Args:
+            obs_image: optional (7,7,3) ndarray from the step observation.
+                       If provided, ``_check_search`` uses it directly
+                       instead of regenerating the observation via
+                       ``env.gen_obs()``.
+        """
         subgoal = subgoal.lower().strip()
 
         if subgoal.startswith("pickup"):
@@ -44,7 +61,7 @@ class SubgoalTracker:
         if subgoal.startswith("drop"):
             return self._check_drop(subgoal, env)
         if subgoal == "explore" or subgoal.startswith("search for"):
-            return self._check_search(subgoal, env)
+            return self._check_search(subgoal, env, obs_image=obs_image)
         return False
 
     # -- checkers --------------------------------------------------------
@@ -90,9 +107,9 @@ class SubgoalTracker:
             return False
         return True
 
-    def _check_search(self, subgoal, env):
+    def _check_search(self, subgoal, env, *, obs_image=None):
         """'explore' succeeds on any visible entity; 'search for X' requires X."""
-        image = env.gen_obs()["image"]
+        image = obs_image if obs_image is not None else env.gen_obs()["image"]
         visible = set()
         for x in range(7):
             for y in range(7):

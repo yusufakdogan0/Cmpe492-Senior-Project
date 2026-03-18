@@ -58,8 +58,10 @@ Environment: {"inventory": "purple key", "boundaries": {"forward": "1 step", "le
 Past Subgoals: pickup the purple key
 Output: Subgoal: open the locked purple door<end>"""
 
+# Maps MiniGrid direction indices to readable names
 IDX_TO_DIRECTION = {0: "east", 1: "south", 2: "west", 3: "north"}
 
+# Regex to pull out the subgoal text between "Subgoal:" and "<end>"
 SUBGOAL_PATTERN = re.compile(r"Subgoal:\s*(.*?)<end>", re.IGNORECASE | re.DOTALL)
 
 
@@ -74,6 +76,7 @@ class LLMPlanner:
     def __init__(self, model_name: str = "qwen2.5:7b", host: str = "http://localhost:11434"):
         self.model_name = model_name
         self.url = f"{host}/api/generate"
+        self.last_raw_response: str = ""
 
     def get_subgoal(
         self,
@@ -112,11 +115,14 @@ class LLMPlanner:
             raw_text = response.json()["response"]
         except requests.Timeout:
             print("[LLMPlanner] Ollama timed out, defaulting to 'explore'")
+            self.last_raw_response = "[timeout]"
             return "explore"
         except (requests.RequestException, KeyError) as e:
             print(f"[LLMPlanner] request failed: {e}")
+            self.last_raw_response = f"[error: {e}]"
             return "explore"
 
+        self.last_raw_response = raw_text
         return self._parse_subgoal(raw_text)
 
     @staticmethod

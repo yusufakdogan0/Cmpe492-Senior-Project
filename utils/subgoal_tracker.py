@@ -123,7 +123,10 @@ class SubgoalTracker:
 
         if subgoal.startswith("search for"):
             tc, tt = self._extract_color_and_type(subgoal)
-            return f"{tc} {tt}" in visible
+            if tc:
+                return f"{tc} {tt}" in visible
+            # Color-less search: match any entity of the right type
+            return any(item.endswith(f" {tt}") for item in visible)
         return len(visible) > 0
 
     # -- parsing helpers -------------------------------------------------

@@ -53,7 +53,13 @@ class RuleBasedPlanner:
         if "go to" in mission_lower:
             return self._goto_subgoal(mission_lower, entities)
 
-        return "explore"
+        # Unrecognized mission — best-effort: parse color+type from mission
+        color, obj_type = _parse_color_and_type(mission_lower)
+        if color and obj_type:
+            return f"search for the {color} {obj_type}"
+        if obj_type:
+            return f"search for the {obj_type}"
+        return "search for the key"
 
     # -- mission-specific strategies ------------------------------------
 
@@ -61,25 +67,37 @@ class RuleBasedPlanner:
         """DoorKey: get key -> open locked door -> reach goal."""
         keys = self._find_entities(entities, obj_type="key")
         locked_doors = self._find_entities(entities, obj_type="door", status="locked")
+        all_doors = self._find_entities(entities, obj_type="door")
         goals = self._find_entities(entities, obj_type="goal")
 
-        carrying_key = "key" in inventory
+        inv_words = inventory.lower().split()
+        carrying_key = "key" in inv_words
 
         if not carrying_key:
             if keys:
                 color = self._entity_color(keys[0])
                 return f"pickup the {color} key"
-            return "explore"
+            # Key not visible — infer color from visible door if possible
+            if all_doors:
+                door_color = self._entity_color(all_doors[0])
+                return f"search for the {door_color} key"
+            return "search for the key"
 
+        # Carrying key — look for locked door
         if locked_doors:
             color = self._entity_color(locked_doors[0])
             return f"open the locked {color} door"
 
+        # Door already open — head for the goal
         if goals:
             color = self._entity_color(goals[0])
             return f"go to the {color} goal"
 
-        return "explore"
+        # Has key but can't see door or goal — infer door color from carried key
+        inv_color = _extract_color_from_words(inv_words)
+        if inv_color:
+            return f"search for the locked {inv_color} door"
+        return "search for the locked door"
 
     def _pickup_subgoal(
         self, mission: str, inventory: str, entities: list[dict]
@@ -87,35 +105,50 @@ class RuleBasedPlanner:
         """UnlockPickup / generic pickup: acquire prerequisites then pick up target."""
         target_color, target_type = _parse_color_and_type(mission)
 
-        # Already carrying the target -- mission should complete on its own.
-        if target_type and target_type in inventory and target_color in inventory:
-            return "explore"
+        # Already carrying the target — mission should complete on its own.
+        inv_words = inventory.lower().split()
+        if target_type and target_type in inv_words and target_color in inv_words:
+            # Dead code in practice (env terminates on pickup), but safe fallback
+            return f"pickup the {target_color} {target_type}"
 
         # Check if a locked door blocks the way; if so, get the key first.
         locked_doors = self._find_entities(entities, obj_type="door", status="locked")
-        if locked_doors and "key" not in inventory:
+        if locked_doors and "key" not in inv_words:
             keys = self._find_entities(entities, obj_type="key")
             if keys:
                 color = self._entity_color(keys[0])
                 return f"pickup the {color} key"
-            return "explore"
+            # No key visible — infer color from visible locked door
+            door_color = self._entity_color(locked_doors[0])
+            if door_color:
+                return f"search for the {door_color} key"
+            return "search for the key"
 
-        if locked_doors and "key" in inventory:
+        if locked_doors and "key" in inv_words:
             color = self._entity_color(locked_doors[0])
             return f"open the locked {color} door"
 
-        # No door blocking -- go for the target directly.
-        targets = self._find_entities(entities, obj_type=target_type)
+        # No door blocking — go for the target directly.
+        targets = self._find_entities(
+            entities, obj_type=target_type, color=target_color
+        )
         if targets:
             color = self._entity_color(targets[0])
             return f"pickup the {color} {target_type}"
 
-        return "explore"
+        # Target not visible — search for it
+        if target_color and target_type:
+            return f"search for the {target_color} {target_type}"
+        if target_type:
+            return f"search for the {target_type}"
+        return "search for the key"
 
     def _goto_subgoal(self, mission: str, entities: list[dict]) -> str:
         """GoToObject / GoToDoor: navigate to the named target."""
         target_color, target_type = _parse_color_and_type(mission)
-        targets = self._find_entities(entities, obj_type=target_type)
+        targets = self._find_entities(
+            entities, obj_type=target_type, color=target_color
+        )
         if targets:
             color = self._entity_color(targets[0])
             label = f"the {color} {target_type}"
@@ -124,7 +157,13 @@ class RuleBasedPlanner:
                 if status:
                     label = f"the {status} {color} {target_type}"
             return f"go to {label}"
-        return "explore"
+
+        # Target not visible — search for it
+        if target_color and target_type:
+            return f"search for the {target_color} {target_type}"
+        if target_type:
+            return f"search for the {target_type}"
+        return "search for the key"
 
     # -- entity helpers --------------------------------------------------
 
@@ -133,14 +172,21 @@ class RuleBasedPlanner:
         entities: list[dict],
         obj_type: str,
         status: str | None = None,
+        color: str | None = None,
     ) -> list[dict]:
-        """Filter visible entities by object type and optional door status."""
+        """Filter visible entities by object type, optional status, and optional color.
+
+        Uses word-level matching instead of substring to avoid false positives
+        (e.g. 'key' would not accidentally match hypothetical 'monkey').
+        """
         results = []
         for e in entities:
-            name = e.get("entity", "").lower()
-            if obj_type and obj_type not in name:
+            words = e.get("entity", "").lower().split()
+            if obj_type and obj_type not in words:
                 continue
-            if status and status not in name:
+            if status and status not in words:
+                continue
+            if color and color not in words:
                 continue
             results.append(e)
         return results
@@ -171,6 +217,14 @@ def _parse_color_and_type(text: str) -> tuple[str, str]:
     return color, obj_type
 
 
+def _extract_color_from_words(words: list[str]) -> str:
+    """Extract the first known color from a list of words."""
+    for word in words:
+        if word in KNOWN_COLORS:
+            return word
+    return ""
+
+
 # -- self-test -----------------------------------------------------------
 
 if __name__ == "__main__":
@@ -198,4 +252,14 @@ if __name__ == "__main__":
         )
         print(f"Seed {seed} | mission={obs['mission']!r} -> {subgoal}")
 
+        # Verify subgoal is NOT "explore"
+        assert subgoal != "explore", f"Planner returned 'explore' for seed {seed}"
+        # Verify subgoal is recognized by SubgoalTracker
+        from utils.subgoal_tracker import SubgoalTracker
+        assert SubgoalTracker.is_recognized(subgoal), (
+            f"Subgoal not recognized by tracker: {subgoal!r}"
+        )
+
+    print("=" * 60)
+    print("  All assertions passed.")
     print("=" * 60)

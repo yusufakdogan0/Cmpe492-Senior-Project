@@ -9,7 +9,7 @@ the reward scaffolding when comparing results.
 Supports:
     - DoorKey variants  ("use the key to open the door and then get to the goal")
     - UnlockPickup      ("pick up the <color> <object>")
-    - GoToObject / GoToDoor  (single navigation objective)
+    - GoToObject / GoToDoor  (mapped to ``search for`` / ``open`` / ``pickup`` / ``close`` — no ``go to`` subgoals)
 """
 
 from __future__ import annotations
@@ -30,9 +30,28 @@ class RuleBasedPlanner:
 
     Shares the same ``get_subgoal`` interface so either planner can be
     injected into the training loop without changes.
+
+    ``last_raw_response`` is set to the returned subgoal string on each call
+    (parity with ``LLMPlanner`` for JSONL logging).
     """
 
+    def __init__(self) -> None:
+        self.last_raw_response: str | None = None
+
     def get_subgoal(
+        self,
+        mission: str,
+        env_json_str: str,
+        direction: int | str,
+        past_subgoals: list[str],
+    ) -> str:
+        result = self._get_subgoal_impl(
+            mission, env_json_str, direction, past_subgoals
+        )
+        self.last_raw_response = result
+        return result
+
+    def _get_subgoal_impl(
         self,
         mission: str,
         env_json_str: str,
@@ -45,7 +64,7 @@ class RuleBasedPlanner:
         mission_lower = mission.lower()
 
         if "use the key" in mission_lower or "open the door" in mission_lower:
-            return self._doorkey_subgoal(inventory, entities)
+            return self._doorkey_subgoal(mission_lower, inventory, entities)
 
         if "pick up" in mission_lower or "pickup" in mission_lower:
             return self._pickup_subgoal(mission_lower, inventory, entities)
@@ -63,8 +82,10 @@ class RuleBasedPlanner:
 
     # -- mission-specific strategies ------------------------------------
 
-    def _doorkey_subgoal(self, inventory: str, entities: list[dict]) -> str:
-        """DoorKey: get key -> open locked door -> reach goal."""
+    def _doorkey_subgoal(
+        self, mission_lower: str, inventory: str, entities: list[dict]
+    ) -> str:
+        """DoorKey: get key -> open locked door -> goal via pickup (visible) or search (not)."""
         keys = self._find_entities(entities, obj_type="key")
         locked_doors = self._find_entities(entities, obj_type="door", status="locked")
         all_doors = self._find_entities(entities, obj_type="door")
@@ -88,12 +109,15 @@ class RuleBasedPlanner:
             color = self._entity_color(locked_doors[0])
             return f"open the locked {color} door"
 
-        # Door already open — head for the goal
+        # Door open (no locked door in FOV): goal visible -> pickup; else search goal / door
         if goals:
             color = self._entity_color(goals[0])
-            return f"go to the {color} goal"
+            return f"pickup the {color} goal"
 
-        # Has key but can't see door or goal — infer door color from carried key
+        gc = _goal_color_hint(mission_lower, goals)
+        if all_doors:
+            return f"search for the {gc} goal"
+
         inv_color = _extract_color_from_words(inv_words)
         if inv_color:
             return f"search for the locked {inv_color} door"
@@ -144,21 +168,40 @@ class RuleBasedPlanner:
         return "search for the key"
 
     def _goto_subgoal(self, mission: str, entities: list[dict]) -> str:
-        """GoToObject / GoToDoor: navigate to the named target."""
+        """GoTo* missions without ``go to``: doors/keys/balls as before; goal = pickup if seen else search."""
         target_color, target_type = _parse_color_and_type(mission)
+
         targets = self._find_entities(
             entities, obj_type=target_type, color=target_color
         )
-        if targets:
-            color = self._entity_color(targets[0])
-            label = f"the {color} {target_type}"
-            if target_type == "door":
-                status = self._entity_status(targets[0])
-                if status:
-                    label = f"the {status} {color} {target_type}"
-            return f"go to {label}"
 
-        # Target not visible — search for it
+        if target_type == "door" and targets:
+            door = targets[0]
+            color = self._entity_color(door)
+            status = self._entity_status(door)
+            if status == "locked":
+                return f"open the locked {color} door"
+            if status == "open":
+                return f"close the open {color} door"
+            # closed (unlocked): toggling opens it — same tracker branch as locked wording
+            return f"open the locked {color} door"
+
+        if target_type == "key" and targets:
+            color = self._entity_color(targets[0])
+            return f"pickup the {color} key"
+
+        if target_type in ("ball", "box") and targets:
+            color = self._entity_color(targets[0])
+            return f"pickup the {color} {target_type}"
+
+        if target_type == "goal":
+            if targets:
+                color = self._entity_color(targets[0])
+                return f"pickup the {color} goal"
+            gc = _goal_color_hint(mission.lower(), targets)
+            return f"search for the {gc} goal"
+
+        # Target not visible — search
         if target_color and target_type:
             return f"search for the {target_color} {target_type}"
         if target_type:
@@ -223,6 +266,18 @@ def _extract_color_from_words(words: list[str]) -> str:
         if word in KNOWN_COLORS:
             return word
     return ""
+
+
+def _goal_color_hint(mission_lower: str, goals: list[dict]) -> str:
+    """Color for ``search for the <c> goal`` when the goal is not in the entity list."""
+    for g in goals:
+        for word in g.get("entity", "").lower().split():
+            if word in KNOWN_COLORS:
+                return word
+    c, _ = _parse_color_and_type(mission_lower)
+    if c:
+        return c
+    return "green"
 
 
 # -- self-test -----------------------------------------------------------

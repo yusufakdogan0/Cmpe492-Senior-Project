@@ -19,7 +19,8 @@ Official project documentation, timeline, and milestones are in the [Repository 
 │   └── lgrl_agent.py           # LGRL actor-critic (mission + subgoal via [SEP])
 ├── scripts/
 │   ├── train_baseline.py       # Baseline PPO training (no subgoal guidance)
-│   └── train_lgrl.py           # LGRL training with LLM-guided subgoals
+│   ├── train_lgrl.py           # LGRL training (LLM planner by default)
+│   └── train_lgrl_rule.py      # LGRL rule oracle (standalone script; own training loop)
 ├── utils/
 │   ├── __init__.py
 │   ├── env_parser.py           # MiniGrid 7x7 observation -> JSON for the LLM
@@ -57,6 +58,12 @@ Standard PPO agent conditioned only on the mission string. Used as the control c
 python scripts/train_baseline.py
 ```
 
+| Artifact | Path |
+|----------|------|
+| Metrics CSV | `logs/baseline_metrics.csv` |
+| Checkpoint | `checkpoints/baseline.pt` |
+| Plot | `logs/plots/training_curves.png` |
+
 ### LGRL with LLM planner (default)
 
 The LLM (Qwen 2.5 7B via Ollama) generates subgoals at each decision point during training. Requires the Ollama server running on `localhost:11434`.
@@ -65,13 +72,29 @@ The LLM (Qwen 2.5 7B via Ollama) generates subgoals at each decision point durin
 python scripts/train_lgrl.py
 ```
 
+| Artifact | Path |
+|----------|------|
+| Metrics CSV | `logs/lgrl_llm_metrics.csv` |
+| Checkpoint | `checkpoints/lgrl_llm.pt` |
+| Plot | `logs/plots/lgrl_llm_training_curves.png` |
+| Subgoal log (with `--subgoal-log`) | `logs/lgrl_llm_subgoal_log.jsonl` |
+
 ### LGRL with rule-based oracle (ablation)
 
-A deterministic planner that produces perfect subgoals using hand-coded heuristics. Useful for isolating the effect of LLM guidance from the reward scaffolding.
+A deterministic planner that produces the same subgoal string format as the LLM using hand-coded heuristics. Isolates LLM quality from hierarchical reward and text conditioning. Same PPO loop and `LGRLAgent` as the LLM run.
 
 ```bash
-python scripts/train_lgrl.py --planner rule_based
+python scripts/train_lgrl_rule.py
 ```
+
+Rule training uses this script only (it does not import `train_lgrl.py`). For LLM training use `train_lgrl.py` (optionally `--planner rule_based` still works there if you prefer one file for both).
+
+| Artifact | Path |
+|----------|------|
+| Metrics CSV | `logs/lgrl_rule_metrics.csv` |
+| Checkpoint | `checkpoints/lgrl_rule.pt` |
+| Plot | `logs/plots/lgrl_rule_training_curves.png` |
+| Subgoal log (with `--subgoal-log`) | `logs/lgrl_rule_subgoal_log.jsonl` |
 
 ## Architecture
 

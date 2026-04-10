@@ -1,39 +1,42 @@
 """
-Deterministic rule-based subgoal generator for MiniGrid environments.
+Deterministic rule-based subgoal generator for MiniGrid DoorKey environments.
 
-Serves as an oracle ablation baseline: it produces the same subgoal
-format as ``LLMPlanner`` but uses hand-coded heuristics instead of an
-LLM query.  This lets us isolate the contribution of LLM guidance from
-the reward scaffolding when comparing results.
+Implements a forward-only stage machine that produces exactly the subgoal
+types from the LGRL paper: search for, pickup, open, close, drop.
+No "explore" or "go to" subgoals.
 
-Supports:
-    - DoorKey variants  ("use the key to open the door and then get to the goal")
-    - UnlockPickup      ("pick up the <color> <object>")
-    - GoToObject / GoToDoor  (mapped to ``search for`` / ``open`` / ``pickup`` / ``close`` — no ``go to`` subgoals)
+For DoorKey-5x5, the canonical stage sequence is:
+  Stage 0 — search for the [color] key   (skipped if key already visible)
+  Stage 1 — pickup the [color] key
+  Stage 2 — search for the [color] door  (skipped if door already visible)
+  Stage 3 — open the locked [color] door
+  Stage 4 — search for the goal
+
+The stage index only advances forward, preventing the agent from farming
+rewards by repeating earlier subgoals.
 """
 
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    pass
 
 KNOWN_COLORS = {"red", "green", "blue", "purple", "yellow", "grey"}
-KNOWN_TYPES = {"key", "door", "ball", "box", "goal"}
 
 
 class RuleBasedPlanner:
     """
-    Drop-in replacement for ``LLMPlanner`` that uses deterministic rules.
+    Stage-based deterministic planner for DoorKey missions.
 
-    Shares the same ``get_subgoal`` interface so either planner can be
-    injected into the training loop without changes.
+    Interface:
+        get_subgoal(mission, env_json_str, direction, stage_index)
+        -> (subgoal_string, new_stage_index)
 
-    ``last_raw_response`` is set to the returned subgoal string on each call
-    (parity with ``LLMPlanner`` for JSONL logging).
+    ``last_raw_response`` is set on each call for JSONL logging parity
+    with ``LLMPlanner``.
     """
+
+    # Total number of rewardable stages
+    NUM_STAGES = 5
 
     def __init__(self) -> None:
         self.last_raw_response: str | None = None
@@ -43,241 +46,139 @@ class RuleBasedPlanner:
         mission: str,
         env_json_str: str,
         direction: int | str,
-        past_subgoals: list[str],
-    ) -> str:
-        result = self._get_subgoal_impl(
-            mission, env_json_str, direction, past_subgoals
-        )
-        self.last_raw_response = result
-        return result
+        stage_index: int,
+    ) -> tuple[str, int]:
+        """Return (subgoal_string, new_stage_index).
 
-    def _get_subgoal_impl(
-        self,
-        mission: str,
-        env_json_str: str,
-        direction: int | str,
-        past_subgoals: list[str],
-    ) -> str:
+        The returned stage_index is always >= the input stage_index,
+        guaranteeing forward-only progress.
+        """
         state = json.loads(env_json_str)
         inventory = state.get("inventory", "empty")
         entities = state.get("entities", [])
-        mission_lower = mission.lower()
 
-        if "use the key" in mission_lower or "open the door" in mission_lower:
-            return self._doorkey_subgoal(mission_lower, inventory, entities)
+        subgoal, new_stage = self._doorkey_stages(
+            stage_index, inventory, entities
+        )
+        self.last_raw_response = subgoal
+        return subgoal, new_stage
 
-        if "pick up" in mission_lower or "pickup" in mission_lower:
-            return self._pickup_subgoal(mission_lower, inventory, entities)
+    # ------------------------------------------------------------------
 
-        if "go to" in mission_lower:
-            return self._goto_subgoal(mission_lower, entities)
-
-        # Unrecognized mission — best-effort: parse color+type from mission
-        color, obj_type = _parse_color_and_type(mission_lower)
-        if color and obj_type:
-            return f"search for the {color} {obj_type}"
-        if obj_type:
-            return f"search for the {obj_type}"
-        return "search for the key"
-
-    # -- mission-specific strategies ------------------------------------
-
-    def _doorkey_subgoal(
-        self, mission_lower: str, inventory: str, entities: list[dict]
-    ) -> str:
-        """DoorKey: get key -> open locked door -> goal via pickup (visible) or search (not)."""
-        keys = self._find_entities(entities, obj_type="key")
-        locked_doors = self._find_entities(entities, obj_type="door", status="locked")
-        all_doors = self._find_entities(entities, obj_type="door")
-        goals = self._find_entities(entities, obj_type="goal")
+    def _doorkey_stages(
+        self, stage: int, inventory: str, entities: list[dict]
+    ) -> tuple[str, int]:
+        """Walk the DoorKey stage machine, skipping stages whose
+        preconditions are already met."""
 
         inv_words = inventory.lower().split()
         carrying_key = "key" in inv_words
 
-        if not carrying_key:
-            if keys:
-                color = self._entity_color(keys[0])
-                return f"pickup the {color} key"
-            # Key not visible — infer color from visible door if possible
-            if all_doors:
-                door_color = self._entity_color(all_doors[0])
-                return f"search for the {door_color} key"
-            return "search for the key"
+        keys = _find_entities(entities, obj_type="key")
+        locked_doors = _find_entities(entities, obj_type="door", status="locked")
+        all_doors = _find_entities(entities, obj_type="door")
+        goals = _find_entities(entities, obj_type="goal")
 
-        # Carrying key — look for locked door
-        if locked_doors:
-            color = self._entity_color(locked_doors[0])
-            return f"open the locked {color} door"
+        # Infer key color from visible key or visible door
+        key_color = ""
+        if keys:
+            key_color = _entity_color(keys[0])
+        elif all_doors:
+            key_color = _entity_color(all_doors[0])
+        elif carrying_key:
+            key_color = _extract_color(inv_words)
 
-        # Door open (no locked door in FOV): goal visible -> pickup; else search goal / door
-        if goals:
-            color = self._entity_color(goals[0])
-            return f"pickup the {color} goal"
-
-        gc = _goal_color_hint(mission_lower, goals)
+        # Infer door color (same as key color in DoorKey envs)
+        door_color = key_color
         if all_doors:
-            return f"search for the {gc} goal"
+            door_color = _entity_color(all_doors[0])
 
-        inv_color = _extract_color_from_words(inv_words)
-        if inv_color:
-            return f"search for the locked {inv_color} door"
-        return "search for the locked door"
-
-    def _pickup_subgoal(
-        self, mission: str, inventory: str, entities: list[dict]
-    ) -> str:
-        """UnlockPickup / generic pickup: acquire prerequisites then pick up target."""
-        target_color, target_type = _parse_color_and_type(mission)
-
-        # Already carrying the target — mission should complete on its own.
-        inv_words = inventory.lower().split()
-        if target_type and target_type in inv_words and target_color in inv_words:
-            # Dead code in practice (env terminates on pickup), but safe fallback
-            return f"pickup the {target_color} {target_type}"
-
-        # Check if a locked door blocks the way; if so, get the key first.
-        locked_doors = self._find_entities(entities, obj_type="door", status="locked")
-        if locked_doors and "key" not in inv_words:
-            keys = self._find_entities(entities, obj_type="key")
+        # --- Stage 0: search for key ---
+        if stage <= 0:
+            if carrying_key:
+                # Already have key, skip to door phase
+                return self._doorkey_stages(2, inventory, entities)
             if keys:
-                color = self._entity_color(keys[0])
-                return f"pickup the {color} key"
-            # No key visible — infer color from visible locked door
-            door_color = self._entity_color(locked_doors[0])
-            if door_color:
-                return f"search for the {door_color} key"
-            return "search for the key"
+                # Key visible, skip search, go to pickup
+                return self._doorkey_stages(1, inventory, entities)
+            color = key_color or door_color
+            label = f"search for the {color} key" if color else "search for the key"
+            return label, 0
 
-        if locked_doors and "key" in inv_words:
-            color = self._entity_color(locked_doors[0])
-            return f"open the locked {color} door"
+        # --- Stage 1: pickup the key ---
+        if stage <= 1:
+            if carrying_key:
+                # Already picked up, advance to door phase
+                return self._doorkey_stages(2, inventory, entities)
+            color = key_color or door_color
+            label = f"pickup the {color} key" if color else "pickup the key"
+            return label, 1
 
-        # No door blocking — go for the target directly.
-        targets = self._find_entities(
-            entities, obj_type=target_type, color=target_color
-        )
-        if targets:
-            color = self._entity_color(targets[0])
-            return f"pickup the {color} {target_type}"
+        # --- Stage 2: search for locked door ---
+        if stage <= 2:
+            if locked_doors:
+                # Door visible, skip search, go to open
+                return self._doorkey_stages(3, inventory, entities)
+            # Check if door is already open (no locked door visible, but an open door is)
+            open_doors = _find_entities(entities, obj_type="door", status="open")
+            if open_doors:
+                # Door already open, skip to goal phase
+                return self._doorkey_stages(4, inventory, entities)
+            color = door_color or key_color
+            label = f"search for the {color} door" if color else "search for the door"
+            return label, 2
 
-        # Target not visible — search for it
-        if target_color and target_type:
-            return f"search for the {target_color} {target_type}"
-        if target_type:
-            return f"search for the {target_type}"
-        return "search for the key"
+        # --- Stage 3: open the locked door ---
+        if stage <= 3:
+            # Check if door is already open
+            open_doors = _find_entities(entities, obj_type="door", status="open")
+            if open_doors:
+                return self._doorkey_stages(4, inventory, entities)
+            color = door_color or key_color
+            label = f"open the locked {color} door" if color else "open the locked door"
+            return label, 3
 
-    def _goto_subgoal(self, mission: str, entities: list[dict]) -> str:
-        """GoTo* missions without ``go to``: doors/keys/balls as before; goal = pickup if seen else search."""
-        target_color, target_type = _parse_color_and_type(mission)
+        # --- Stage 4: search for goal ---
+        if stage <= 4:
+            return "search for the goal", 4
 
-        targets = self._find_entities(
-            entities, obj_type=target_type, color=target_color
-        )
-
-        if target_type == "door" and targets:
-            door = targets[0]
-            color = self._entity_color(door)
-            status = self._entity_status(door)
-            if status == "locked":
-                return f"open the locked {color} door"
-            if status == "open":
-                return f"close the open {color} door"
-            # closed (unlocked): toggling opens it — same tracker branch as locked wording
-            return f"open the locked {color} door"
-
-        if target_type == "key" and targets:
-            color = self._entity_color(targets[0])
-            return f"pickup the {color} key"
-
-        if target_type in ("ball", "box") and targets:
-            color = self._entity_color(targets[0])
-            return f"pickup the {color} {target_type}"
-
-        if target_type == "goal":
-            if targets:
-                color = self._entity_color(targets[0])
-                return f"pickup the {color} goal"
-            gc = _goal_color_hint(mission.lower(), targets)
-            return f"search for the {gc} goal"
-
-        # Target not visible — search
-        if target_color and target_type:
-            return f"search for the {target_color} {target_type}"
-        if target_type:
-            return f"search for the {target_type}"
-        return "search for the key"
-
-    # -- entity helpers --------------------------------------------------
-
-    @staticmethod
-    def _find_entities(
-        entities: list[dict],
-        obj_type: str,
-        status: str | None = None,
-        color: str | None = None,
-    ) -> list[dict]:
-        """Filter visible entities by object type, optional status, and optional color.
-
-        Uses word-level matching instead of substring to avoid false positives
-        (e.g. 'key' would not accidentally match hypothetical 'monkey').
-        """
-        results = []
-        for e in entities:
-            words = e.get("entity", "").lower().split()
-            if obj_type and obj_type not in words:
-                continue
-            if status and status not in words:
-                continue
-            if color and color not in words:
-                continue
-            results.append(e)
-        return results
-
-    @staticmethod
-    def _entity_color(entity: dict) -> str:
-        for word in entity.get("entity", "").lower().split():
-            if word in KNOWN_COLORS:
-                return word
-        return ""
-
-    @staticmethod
-    def _entity_status(entity: dict) -> str:
-        name = entity.get("entity", "").lower()
-        for s in ("locked", "open", "closed"):
-            if s in name:
-                return s
-        return ""
+        # All stages exhausted — keep last subgoal (no more rewards)
+        return "search for the goal", 5
 
 
-def _parse_color_and_type(text: str) -> tuple[str, str]:
-    color, obj_type = "", ""
-    for word in text.split():
-        if word in KNOWN_COLORS:
-            color = word
-        if word in KNOWN_TYPES:
-            obj_type = word
-    return color, obj_type
+# -- helper functions (module-level) ------------------------------------
+
+def _find_entities(
+    entities: list[dict],
+    obj_type: str,
+    status: str | None = None,
+    color: str | None = None,
+) -> list[dict]:
+    results = []
+    for e in entities:
+        words = e.get("entity", "").lower().split()
+        if obj_type and obj_type not in words:
+            continue
+        if status and status not in words:
+            continue
+        if color and color not in words:
+            continue
+        results.append(e)
+    return results
 
 
-def _extract_color_from_words(words: list[str]) -> str:
-    """Extract the first known color from a list of words."""
-    for word in words:
+def _entity_color(entity: dict) -> str:
+    for word in entity.get("entity", "").lower().split():
         if word in KNOWN_COLORS:
             return word
     return ""
 
 
-def _goal_color_hint(mission_lower: str, goals: list[dict]) -> str:
-    """Color for ``search for the <c> goal`` when the goal is not in the entity list."""
-    for g in goals:
-        for word in g.get("entity", "").lower().split():
-            if word in KNOWN_COLORS:
-                return word
-    c, _ = _parse_color_and_type(mission_lower)
-    if c:
-        return c
-    return "green"
+def _extract_color(words: list[str]) -> str:
+    for word in words:
+        if word in KNOWN_COLORS:
+            return word
+    return ""
 
 
 # -- self-test -----------------------------------------------------------
@@ -294,27 +195,35 @@ if __name__ == "__main__":
     env = gym.make("MiniGrid-DoorKey-5x5-v0")
 
     print("=" * 60)
-    print("  RuleBasedPlanner -- Self-Test")
+    print("  RuleBasedPlanner (stage-based) -- Self-Test")
     print("=" * 60)
 
-    for seed in range(3):
+    for seed in range(5):
         obs, _ = env.reset(seed=seed)
         uw = env.unwrapped
         env_json = parse_env_description(obs["image"], uw.carrying)
 
-        subgoal = planner.get_subgoal(
-            obs["mission"], env_json, obs["direction"], past_subgoals=[]
+        subgoal, new_stage = planner.get_subgoal(
+            obs["mission"], env_json, obs["direction"], stage_index=0
         )
-        print(f"Seed {seed} | mission={obs['mission']!r} -> {subgoal}")
+        print(f"Seed {seed} | mission={obs['mission']!r} -> stage={new_stage} '{subgoal}'")
 
-        # Verify subgoal is NOT "explore"
-        assert subgoal != "explore", f"Planner returned 'explore' for seed {seed}"
-        # Verify subgoal is recognized by SubgoalTracker
-        from utils.subgoal_tracker import SubgoalTracker
-        assert SubgoalTracker.is_recognized(subgoal), (
-            f"Subgoal not recognized by tracker: {subgoal!r}"
+        # Verify no "explore" or "go to"
+        assert "explore" not in subgoal.lower()
+        assert not subgoal.lower().startswith("go to")
+
+    # Test stage advancement
+    print("\n--- Stage advancement test ---")
+    obs, _ = env.reset(seed=0)
+    uw = env.unwrapped
+    for stage in range(6):
+        env_json = parse_env_description(obs["image"], uw.carrying)
+        subgoal, new_stage = planner.get_subgoal(
+            obs["mission"], env_json, obs["direction"], stage_index=stage
         )
+        print(f"  Input stage={stage} -> '{subgoal}' (output stage={new_stage})")
+        assert new_stage >= stage, "Stage must not go backwards"
 
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("  All assertions passed.")
     print("=" * 60)

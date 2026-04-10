@@ -1,25 +1,16 @@
 """
 LGRL PPO training on MiniGrid-DoorKey-5x5-v0.
 
-Bi-level hierarchy:
-  High level -- an LLM (Qwen 2.5 7B via Ollama) decomposes the mission
-                into a sequence of subgoals at runtime.
-  Low level  -- a PPO agent executes subgoals, conditioned on the
-                concatenated text "mission [SEP] subgoal".
+Stage-based hierarchy with forward-only progression.
+Supports both LLM (Qwen 2.5 7B) and rule-based oracle planners.
 
-A rule-based oracle planner is available as an ablation baseline
-(``--planner rule_based``) to isolate the effect of LLM guidance from
-the reward scaffolding.
-
-Reward scaffolding:
-  r_m  = R_m * (1 - 0.5 * T_used / T_max)         mission completion
-  r_i  = R_t * (1 - 0.5 * T_used / T_i)            subgoal completion
-  r    = r_m + (1/n) * sum(r_i)                     total per episode
+Subgoals follow the LGRL paper: search for, pickup, open, close, drop.
+No "explore" or "go to".
 
 Usage:
-    python scripts/train_lgrl.py                     # LLM planner (default)
+    python scripts/train_lgrl.py                       # LLM planner (default)
     python scripts/train_lgrl.py --planner rule_based  # oracle ablation
-    python scripts/train_lgrl.py --resume              # resume from checkpoint
+    python scripts/train_lgrl.py --resume
 """
 
 import argparse
@@ -31,7 +22,7 @@ import time
 
 import gymnasium as gym
 import matplotlib
-import minigrid  # noqa: F401 -- registers MiniGrid envs
+import minigrid  # noqa: F401
 import numpy as np
 import torch
 
@@ -52,6 +43,7 @@ from utils.env_parser import parse_env_description
 from utils.llm_planner import LLMPlanner
 from utils.rule_based_planner import RuleBasedPlanner
 from utils.subgoal_tracker import SubgoalTracker
+from utils.subgoal_logger import SubgoalLogger
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -62,7 +54,6 @@ NUM_ENVS            = 16
 NUM_FRAMES_PER_PROC = 128
 TOTAL_FRAMES        = 10_000_000
 
-# PPO hyperparameters
 LR              = 1e-4
 DISCOUNT        = 0.99
 GAE_LAMBDA      = 0.95
@@ -74,10 +65,9 @@ EPOCHS          = 4
 BATCH_SIZE      = 256
 RECURRENCE      = 4
 
-# Reward scaffolding
 R_MISSION       = 0.5
 R_SUBGOAL       = 0.5
-N_SUBGOALS_EST  = 5
+N_SUBGOALS      = RuleBasedPlanner.NUM_STAGES  # 5
 MAX_ENV_STEPS   = 250
 
 CHECKPOINT_DIR  = os.path.join(PROJECT_ROOT, "checkpoints")
@@ -94,69 +84,77 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Train the LGRL agent with LLM or rule-based subgoal planning."
-    )
-    parser.add_argument(
-        "--planner",
-        choices=["llm", "rule_based"],
-        default="llm",
-        help="Subgoal generation strategy. 'llm' queries Qwen via Ollama "
-             "(default). 'rule_based' uses a deterministic oracle for ablation.",
-    )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume training from the latest checkpoint (loads model, "
-             "optimizer, counters and appends to the existing CSV).",
-    )
-    parser.add_argument(
-        "--subgoal-log",
-        action="store_true",
-        default=False,
-        help="Enable per-subgoal JSONL logging to logs/subgoal_log.jsonl.",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--planner", choices=["llm", "rule_based"], default="llm")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--subgoal-log", action="store_true", default=False)
     return parser.parse_args()
 
 # ---------------------------------------------------------------------------
-# Per-env hierarchy state
+# Per-env hierarchy state (stage-based, forward-only)
 # ---------------------------------------------------------------------------
 
 class HierarchyState:
-    """Tracks active subgoals, step budgets, and history for all parallel envs."""
-
-    def __init__(self, num_envs: int):
+    def __init__(self, num_envs: int, planner, envs: list):
         self.num_envs = num_envs
-        self.reset_all()
+        self.planner = planner
+        self.envs = envs
+        self._init_lists()
 
-    def reset_all(self):
-        self.active_subgoals: list[str] = ["explore"] * self.num_envs
-        self.step_counters:   list[int] = [0] * self.num_envs
-        self.subgoal_indices: list[int] = [1] * self.num_envs
-        self.histories: list[list[dict]] = [[] for _ in range(self.num_envs)]
-        self.trackers:  list[SubgoalTracker] = [SubgoalTracker() for _ in range(self.num_envs)]
+    def _init_lists(self):
+        self.active_subgoals: list[str] = [""] * self.num_envs
+        self.stage_indices: list[int] = [0] * self.num_envs
+        self.step_counters: list[int] = [0] * self.num_envs
         self.episode_steps: list[int] = [0] * self.num_envs
+        self.trackers: list[SubgoalTracker] = [
+            SubgoalTracker() for _ in range(self.num_envs)
+        ]
+        self.histories: list[list[dict]] = [[] for _ in range(self.num_envs)]
+
+    def init_env_subgoal(self, env_idx: int, obs: dict):
+        uw = self.envs[env_idx].unwrapped
+        env_json = parse_env_description(obs["image"], uw.carrying)
+        subgoal, new_stage = self.planner.get_subgoal(
+            obs["mission"], env_json, obs.get("direction", 0), stage_index=0
+        )
+        self.active_subgoals[env_idx] = subgoal
+        self.stage_indices[env_idx] = new_stage
 
     def reset_env(self, env_idx: int):
-        self.active_subgoals[env_idx] = "explore"
-        self.step_counters[env_idx]   = 0
-        self.subgoal_indices[env_idx] = 1
-        self.histories[env_idx]       = []
+        self.active_subgoals[env_idx] = ""
+        self.stage_indices[env_idx] = 0
+        self.step_counters[env_idx] = 0
+        self.episode_steps[env_idx] = 0
         self.trackers[env_idx].reset()
-        self.episode_steps[env_idx]   = 0
+        self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """T_i = (i/n)*T_max from LGRL paper (Mathematics 2025, Eq. 6); i clamped to n."""
-        i = min(self.subgoal_indices[env_idx], N_SUBGOALS_EST)
-        return (i / N_SUBGOALS_EST) * MAX_ENV_STEPS
+        i = min(self.stage_indices[env_idx] + 1, N_SUBGOALS)
+        return (i / N_SUBGOALS) * MAX_ENV_STEPS
+
+    def advance(self, env_idx: int, obs: dict):
+        next_stage = self.stage_indices[env_idx] + 1
+        if next_stage >= N_SUBGOALS:
+            self.stage_indices[env_idx] = N_SUBGOALS
+            self.active_subgoals[env_idx] = "search for the goal"
+            self.step_counters[env_idx] = 0
+            return
+
+        uw = self.envs[env_idx].unwrapped
+        env_json = parse_env_description(obs["image"], uw.carrying)
+        subgoal, new_stage = self.planner.get_subgoal(
+            obs["mission"], env_json, obs.get("direction", 0),
+            stage_index=next_stage,
+        )
+        self.active_subgoals[env_idx] = subgoal
+        self.stage_indices[env_idx] = new_stage
+        self.step_counters[env_idx] = 0
 
 # ---------------------------------------------------------------------------
 # Observation preprocessing
 # ---------------------------------------------------------------------------
 
 def make_preprocess_obss(vocab, hierarchy_state, device=None):
-    """Tokenise "mission [SEP] subgoal" and normalise the image tensor."""
-
     def preprocess_obss(obss, device=device):
         images = np.array([obs["image"] for obs in obss])
         images = torch.tensor(images, dtype=torch.float32, device=device)
@@ -167,8 +165,10 @@ def make_preprocess_obss(vocab, hierarchy_state, device=None):
             subgoal = (
                 hierarchy_state.active_subgoals[i]
                 if i < hierarchy_state.num_envs
-                else "explore"
+                else "search for the goal"
             )
+            if not subgoal:
+                subgoal = "search for the key"
             combined = f"{obs['mission']} [SEP] {subgoal}"
             token_ids.append(vocab.tokenize(combined, max_len=32))
 
@@ -176,10 +176,6 @@ def make_preprocess_obss(vocab, hierarchy_state, device=None):
         return torch_ac.DictList({"image": images, "text": texts})
 
     return preprocess_obss
-
-# ---------------------------------------------------------------------------
-# Environment factory
-# ---------------------------------------------------------------------------
 
 def make_env(env_name: str, seed: int):
     env = gym.make(env_name)
@@ -190,14 +186,7 @@ def make_env(env_name: str, seed: int):
 # Reward shaping
 # ---------------------------------------------------------------------------
 
-def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
-    """
-    Build the ``reshape_reward`` callback consumed by ``torch_ac.PPOAlgo``.
-
-    torch-ac invokes the callback once per env per step in a deterministic
-    order, so we track the env index with a cycling counter.
-    """
-
+def make_reshape_reward(hierarchy_state, logger=None):
     def reshape_reward(obs, action, reward, done):
         env_idx = reshape_reward._current_env_idx
         reshape_reward._current_env_idx = (env_idx + 1) % hierarchy_state.num_envs
@@ -205,16 +194,39 @@ def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
         total_reward = 0.0
         hierarchy_state.step_counters[env_idx] += 1
         hierarchy_state.episode_steps[env_idx] += 1
+        mission = obs.get("mission", "")
 
         if done:
-            if reward > 0:
+            success = reward > 0
+            if success:
                 t_total = hierarchy_state.episode_steps[env_idx]
                 ratio = min(t_total / MAX_ENV_STEPS, 1.0)
                 total_reward += R_MISSION * (1.0 - 0.5 * ratio)
+            if logger:
+                logger.on_episode_end(
+                    env_idx, mission, success,
+                    hierarchy_state.episode_steps[env_idx],
+                )
             hierarchy_state.reset_env(env_idx)
             return total_reward
 
-        uw = envs[env_idx].unwrapped
+        if hierarchy_state.stage_indices[env_idx] >= N_SUBGOALS:
+            return total_reward
+
+        if not hierarchy_state.active_subgoals[env_idx]:
+            hierarchy_state.init_env_subgoal(env_idx, obs)
+            if logger:
+                uw = hierarchy_state.envs[env_idx].unwrapped
+                env_json = parse_env_description(obs["image"], uw.carrying)
+                logger.log(
+                    env_idx, "init", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                )
+
+        uw = hierarchy_state.envs[env_idx].unwrapped
         subgoal = hierarchy_state.active_subgoals[env_idx]
         completed = hierarchy_state.trackers[env_idx].check_completion(
             subgoal, uw, action, obs_image=obs["image"],
@@ -227,82 +239,65 @@ def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
         if completed:
             ratio = min(t_used / max(t_budget, 1), 2.0)
             r_i = max(R_SUBGOAL * (1.0 - 0.5 * ratio), 0.0)
-            total_reward += r_i / N_SUBGOALS_EST
+            total_reward += r_i / N_SUBGOALS
 
             hierarchy_state.histories[env_idx].append(
-                {"subgoal": subgoal, "status": "Success", "steps": t_used}
+                {"subgoal": subgoal, "status": "Success", "steps": t_used,
+                 "stage": hierarchy_state.stage_indices[env_idx]}
             )
-            _log_subgoal_event(subgoal_log, env_idx, "completed",
-                               obs.get("mission", ""), subgoal,
-                               t_used, t_budget, r_i / N_SUBGOALS_EST)
-            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
-                             subgoal_log)
+            if logger:
+                logger.log(
+                    env_idx, "completed", mission=mission, subgoal=subgoal,
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    steps_used=t_used, budget=t_budget,
+                    reward=r_i / N_SUBGOALS,
+                )
+            hierarchy_state.advance(env_idx, obs)
+            if logger:
+                env_json = parse_env_description(
+                    obs["image"], hierarchy_state.envs[env_idx].unwrapped.carrying,
+                )
+                logger.log(
+                    env_idx, "new", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                    raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
+                )
 
         elif timed_out:
             hierarchy_state.histories[env_idx].append(
-                {"subgoal": subgoal, "status": "Failed", "steps": t_used}
+                {"subgoal": subgoal, "status": "Failed", "steps": t_used,
+                 "stage": hierarchy_state.stage_indices[env_idx]}
             )
-            _log_subgoal_event(subgoal_log, env_idx, "timed_out",
-                               obs.get("mission", ""), subgoal,
-                               t_used, t_budget, 0.0)
-            _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
-                             subgoal_log)
+            if logger:
+                logger.log(
+                    env_idx, "timed_out", mission=mission, subgoal=subgoal,
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    steps_used=t_used, budget=t_budget,
+                )
+            hierarchy_state.advance(env_idx, obs)
+            if logger:
+                env_json = parse_env_description(
+                    obs["image"], hierarchy_state.envs[env_idx].unwrapped.carrying,
+                )
+                logger.log(
+                    env_idx, "new", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                    raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
+                )
 
         return total_reward
 
     reshape_reward._current_env_idx = 0
     return reshape_reward
 
-
-def _log_subgoal_event(log_file, env_idx, event, mission, subgoal,
-                       steps_used, budget, reward_given,
-                       env_state=None, raw_llm=None):
-    """Write a single JSON line to the subgoal log."""
-    if log_file is None:
-        return
-    entry = {
-        "env": env_idx,
-        "event": event,
-        "mission": mission,
-        "subgoal": subgoal,
-        "valid": SubgoalTracker.is_recognized(subgoal),
-        "steps_used": steps_used,
-        "budget": round(budget, 1),
-        "reward": round(reward_given, 6),
-    }
-    if env_state is not None:
-        entry["env_state"] = env_state
-    if raw_llm is not None:
-        entry["raw_llm_response"] = raw_llm
-    log_file.write(json.dumps(entry) + "\n")
-    log_file.flush()
-
-
-def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
-                     subgoal_log=None):
-    """Query the planner for a new subgoal and advance the paper subgoal index *i* when appropriate."""
-    env_json = parse_env_description(obs["image"], uw.carrying)
-    direction = obs.get("direction", 0)
-    hist = hierarchy_state.histories[env_idx]
-    past = [h["subgoal"] for h in hist]
-
-    new_subgoal = planner.get_subgoal(obs["mission"], env_json, direction, past)
-
-    raw_llm = getattr(planner, "last_raw_response", None)
-
-    hierarchy_state.active_subgoals[env_idx] = new_subgoal
-    hierarchy_state.step_counters[env_idx] = 0
-    finished = (hist[-1]["subgoal"] if hist else "").strip().lower()
-    if finished != "explore":
-        hierarchy_state.subgoal_indices[env_idx] += 1
-
-    _log_subgoal_event(subgoal_log, env_idx, "new",
-                       obs.get("mission", ""), new_subgoal,
-                       0, hierarchy_state.subgoal_budget(env_idx), 0.0,
-                       env_state=env_json, raw_llm=raw_llm)
-
 # ---------------------------------------------------------------------------
-# Plotting
+# Plotting / checkpointing
 # ---------------------------------------------------------------------------
 
 def _smooth(values, window=20):
@@ -319,12 +314,8 @@ def save_plots(history, plot_dir, planner_tag):
     frames = history["frames"]
     if len(frames) < 2:
         return
-
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle(
-        f"LGRL PPO ({planner_tag}) -- Training Curves",
-        fontsize=14, fontweight="bold",
-    )
+    fig.suptitle(f"LGRL PPO ({planner_tag}) -- Training Curves", fontsize=14, fontweight="bold")
 
     ax = axes[0, 0]
     ax.plot(frames, history["avg_return"], alpha=0.3, color="tab:blue", linewidth=0.5)
@@ -353,26 +344,18 @@ def save_plots(history, plot_dir, planner_tag):
     plt.savefig(os.path.join(plot_dir, "lgrl_training_curves.png"), dpi=150)
     plt.close(fig)
 
-# ---------------------------------------------------------------------------
-# Checkpointing
-# ---------------------------------------------------------------------------
 
 def _save_checkpoint(path, model, algo, vocab, update, total_frames, planner_tag):
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": algo.optimizer.state_dict(),
-            "vocab": vocab.word2idx,
-            "update": update,
-            "total_frames": total_frames,
-            "planner": planner_tag,
-        },
-        path,
-    )
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": algo.optimizer.state_dict(),
+        "vocab": vocab.word2idx,
+        "update": update, "total_frames": total_frames,
+        "planner": planner_tag,
+    }, path)
 
 
 def _load_history_from_csv(csv_path, csv_fields):
-    """Re-read an existing metrics CSV into the history dict for plotting continuity."""
     history = {k: [] for k in csv_fields}
     if not os.path.exists(csv_path):
         return history
@@ -382,7 +365,6 @@ def _load_history_from_csv(csv_path, csv_fields):
             for k in csv_fields:
                 history[k].append(float(row[k]))
     return history
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -396,22 +378,22 @@ def main():
     checkpoint_path = os.path.join(CHECKPOINT_DIR, "lgrl.pt")
 
     print("=" * 60)
-    print("  LGRL PPO Training -- MiniGrid-DoorKey-5x5-v0")
+    print("  LGRL PPO Training (stage-based) -- MiniGrid-DoorKey-5x5-v0")
     print("=" * 60)
     print(f"  Device         : {DEVICE}")
     print(f"  Envs           : {NUM_ENVS} parallel")
     print(f"  Frames         : {TOTAL_FRAMES:,}")
     print(f"  Planner        : {planner_tag}")
+    print(f"  Stages         : {N_SUBGOALS}")
     print(f"  R_mission      : {R_MISSION}")
     print(f"  R_subgoal      : {R_SUBGOAL}")
-    print(f"  Subgoal budget : T_i = (i/{N_SUBGOALS_EST}) * {MAX_ENV_STEPS}")
     print("=" * 60)
 
     envs = [make_env(ENV_NAME, seed=i) for i in range(NUM_ENVS)]
 
     vocab = Vocabulary()
     sample_obs, _ = gym.make(ENV_NAME).reset()
-    vocab.tokenize(f"{sample_obs['mission']} [SEP] explore", max_len=32)
+    vocab.tokenize(f"{sample_obs['mission']} [SEP] search for the yellow key", max_len=32)
 
     obs_space = envs[0].observation_space
     act_space = envs[0].action_space
@@ -422,37 +404,29 @@ def main():
     print(f"  Model params   : {sum(p.numel() for p in model.parameters()):,}")
     print("=" * 60)
 
-    hierarchy_state = HierarchyState(NUM_ENVS)
-
     if planner_tag == "llm":
         planner = LLMPlanner()
     else:
         planner = RuleBasedPlanner()
 
-    subgoal_log_path = os.path.join(LOG_DIR, "subgoal_log.jsonl")
-    subgoal_log = open(subgoal_log_path, "a", encoding="utf-8") if args.subgoal_log else None
+    hierarchy_state = HierarchyState(NUM_ENVS, planner, envs)
+
+    logger = (
+        SubgoalLogger(LOG_DIR, "lgrl", NUM_ENVS)
+        if args.subgoal_log else None
+    )
 
     preprocess_obss = make_preprocess_obss(vocab, hierarchy_state, device=DEVICE)
-    reshape_reward = make_reshape_reward(hierarchy_state, planner, envs,
-                                         subgoal_log=subgoal_log)
+    reshape_reward = make_reshape_reward(hierarchy_state, logger=logger)
 
     algo = torch_ac.PPOAlgo(
-        envs=envs,
-        acmodel=model,
-        device=DEVICE,
+        envs=envs, acmodel=model, device=DEVICE,
         num_frames_per_proc=NUM_FRAMES_PER_PROC,
-        discount=DISCOUNT,
-        lr=LR,
-        gae_lambda=GAE_LAMBDA,
-        entropy_coef=ENTROPY_COEF,
-        value_loss_coef=VALUE_LOSS_COEF,
-        max_grad_norm=MAX_GRAD_NORM,
-        recurrence=RECURRENCE,
-        clip_eps=CLIP_EPS,
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        preprocess_obss=preprocess_obss,
-        reshape_reward=reshape_reward,
+        discount=DISCOUNT, lr=LR, gae_lambda=GAE_LAMBDA,
+        entropy_coef=ENTROPY_COEF, value_loss_coef=VALUE_LOSS_COEF,
+        max_grad_norm=MAX_GRAD_NORM, recurrence=RECURRENCE,
+        clip_eps=CLIP_EPS, epochs=EPOCHS, batch_size=BATCH_SIZE,
+        preprocess_obss=preprocess_obss, reshape_reward=reshape_reward,
     )
 
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -476,8 +450,7 @@ def main():
             algo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         update = ckpt.get("update", 0)
         total_frames = ckpt.get("total_frames", 0)
-        print(f"  Resumed from checkpoint: update={update}, frames={total_frames:,}")
-
+        print(f"  Resumed: update={update}, frames={total_frames:,}")
         history = _load_history_from_csv(csv_path, csv_fields)
         csv_file = open(csv_path, "a", newline="")
         csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
@@ -488,8 +461,6 @@ def main():
         csv_writer.writeheader()
 
     print(f"\n  Logging to : {csv_path}")
-    if subgoal_log is not None:
-        print(f"  Subgoal log: {subgoal_log_path}")
     print(f"  Plots      : {PLOT_DIR}")
     print(
         f"\n{'Update':>7} | {'Frames':>10} | {'Avg Return':>11} | {'Avg Steps':>10} | "
@@ -519,14 +490,10 @@ def main():
         )
 
         row = {
-            "update": update,
-            "frames": total_frames,
-            "avg_return": f"{avg_return:.6f}",
-            "avg_steps": f"{avg_steps:.1f}",
-            "entropy": f"{entropy:.6f}",
-            "policy_loss": f"{policy_loss:.6f}",
-            "value_loss": f"{value_loss:.6f}",
-            "elapsed_sec": f"{elapsed:.1f}",
+            "update": update, "frames": total_frames,
+            "avg_return": f"{avg_return:.6f}", "avg_steps": f"{avg_steps:.1f}",
+            "entropy": f"{entropy:.6f}", "policy_loss": f"{policy_loss:.6f}",
+            "value_loss": f"{value_loss:.6f}", "elapsed_sec": f"{elapsed:.1f}",
         }
         csv_writer.writerow(row)
         csv_file.flush()
@@ -536,22 +503,19 @@ def main():
         if update % CHECKPOINT_EVERY == 0:
             _save_checkpoint(checkpoint_path, model, algo, vocab,
                              update, total_frames, planner_tag)
-
         if update % PLOT_EVERY == 0:
             save_plots(history, PLOT_DIR, planner_tag)
 
     _save_checkpoint(checkpoint_path, model, algo, vocab,
                      update, total_frames, planner_tag)
     csv_file.close()
-    if subgoal_log is not None:
-        subgoal_log.close()
+    if logger is not None:
+        logger.close()
     save_plots(history, PLOT_DIR, planner_tag)
 
     print(f"\nTraining complete.")
     print(f"  Checkpoint : {checkpoint_path}")
     print(f"  Metrics    : {csv_path}")
-    if subgoal_log is not None:
-        print(f"  Subgoal log: {subgoal_log_path}")
     print(f"  Plots      : {PLOT_DIR}")
     print(f"  Updates: {update}, Frames: {total_frames:,}")
 

@@ -1,16 +1,15 @@
 """
 LGRL PPO training with the rule-based oracle planner only.
 
-This script is self-contained: it does not import ``train_lgrl.py``.
-Use ``python scripts/train_lgrl.py`` for LLM-based training.
+Stage-based hierarchy: the planner produces a fixed forward-only sequence
+of subgoals (search for, pickup, open, search for goal) matching the LGRL
+paper.  No "explore" or "go to" subgoals.
 
-Outputs (under project ``logs/`` and ``checkpoints/``):
-  - ``logs/lgrl_rule_metrics.csv``
-  - ``checkpoints/lgrl_rule.pt``
-  - ``logs/plots/lgrl_rule_training_curves.png``
-  - ``logs/lgrl_rule_subgoal_log.jsonl`` (with ``--subgoal-log``)
-
-Reward scaffolding matches the LGRL setup (mission + shaped subgoal rewards).
+Outputs:
+  - logs/lgrl_rule_metrics.csv
+  - checkpoints/lgrl_rule.pt
+  - logs/plots/lgrl_rule_training_curves.png
+  - logs/lgrl_rule_subgoal_log/env_00.jsonl ... env_15.jsonl  (with --subgoal-log)
 
 Usage:
     python scripts/train_lgrl_rule.py
@@ -29,7 +28,7 @@ import time
 
 import gymnasium as gym
 import matplotlib
-import minigrid  # noqa: F401 -- registers MiniGrid envs
+import minigrid  # noqa: F401
 import numpy as np
 import torch
 
@@ -50,6 +49,7 @@ from models.lgrl_agent import LGRLAgent
 from utils.env_parser import parse_env_description
 from utils.rule_based_planner import RuleBasedPlanner
 from utils.subgoal_tracker import SubgoalTracker
+from utils.subgoal_logger import SubgoalLogger
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -73,7 +73,7 @@ RECURRENCE = 4
 
 R_MISSION = 0.5
 R_SUBGOAL = 0.5
-N_SUBGOALS_EST = 5
+N_SUBGOALS = RuleBasedPlanner.NUM_STAGES  # 5 stages
 MAX_ENV_STEPS = 250
 
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
@@ -83,7 +83,6 @@ LOG_DIR = os.path.join(PROJECT_ROOT, "logs")
 PLOT_DIR = os.path.join(LOG_DIR, "plots")
 PLOT_EVERY = 50
 
-# Isolated from LLM runs (train_lgrl.py uses its own filenames).
 ARTIFACT_STEM = "lgrl_rule"
 PLANNER_TAG = "rule_based"
 
@@ -94,49 +93,86 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train LGRL with the deterministic rule-based subgoal planner."
     )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from checkpoints/lgrl_rule.pt (appends to lgrl_rule_metrics.csv).",
-    )
-    parser.add_argument(
-        "--subgoal-log",
-        action="store_true",
-        default=False,
-        help="Append subgoal events to logs/lgrl_rule_subgoal_log.jsonl.",
-    )
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--subgoal-log", action="store_true", default=False)
     return parser.parse_args()
 
 
+# ---------------------------------------------------------------------------
+# Per-env hierarchy state (stage-based, forward-only)
+# ---------------------------------------------------------------------------
+
 class HierarchyState:
-    """Tracks active subgoals, step budgets, and history for all parallel envs."""
+    """Tracks the current stage, active subgoal, and step budgets per env.
 
-    def __init__(self, num_envs: int):
+    The stage index only advances forward — once a stage is completed
+    (or timed out), the planner is queried with the next stage index,
+    preventing the agent from farming rewards on repeated subgoals.
+    """
+
+    def __init__(self, num_envs: int, planner: RuleBasedPlanner, envs: list):
         self.num_envs = num_envs
-        self.reset_all()
+        self.planner = planner
+        self.envs = envs
+        self._init_lists()
 
-    def reset_all(self):
-        self.active_subgoals: list[str] = ["explore"] * self.num_envs
+    def _init_lists(self):
+        self.active_subgoals: list[str] = [""] * self.num_envs
+        self.stage_indices: list[int] = [0] * self.num_envs
         self.step_counters: list[int] = [0] * self.num_envs
-        self.subgoal_indices: list[int] = [1] * self.num_envs
-        self.histories: list[list[dict]] = [[] for _ in range(self.num_envs)]
+        self.episode_steps: list[int] = [0] * self.num_envs
         self.trackers: list[SubgoalTracker] = [
             SubgoalTracker() for _ in range(self.num_envs)
         ]
-        self.episode_steps: list[int] = [0] * self.num_envs
+        self.histories: list[list[dict]] = [[] for _ in range(self.num_envs)]
+
+    def init_env_subgoal(self, env_idx: int, obs: dict):
+        """Query planner for the initial subgoal at stage 0."""
+        uw = self.envs[env_idx].unwrapped
+        env_json = parse_env_description(obs["image"], uw.carrying)
+        subgoal, new_stage = self.planner.get_subgoal(
+            obs["mission"], env_json, obs.get("direction", 0), stage_index=0
+        )
+        self.active_subgoals[env_idx] = subgoal
+        self.stage_indices[env_idx] = new_stage
 
     def reset_env(self, env_idx: int):
-        self.active_subgoals[env_idx] = "explore"
+        self.active_subgoals[env_idx] = ""
+        self.stage_indices[env_idx] = 0
         self.step_counters[env_idx] = 0
-        self.subgoal_indices[env_idx] = 1
-        self.histories[env_idx] = []
-        self.trackers[env_idx].reset()
         self.episode_steps[env_idx] = 0
+        self.trackers[env_idx].reset()
+        self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        i = min(self.subgoal_indices[env_idx], N_SUBGOALS_EST)
-        return (i / N_SUBGOALS_EST) * MAX_ENV_STEPS
+        """T_i = (i/n) * T_max  (paper Eq. 6), using 1-indexed stage."""
+        i = min(self.stage_indices[env_idx] + 1, N_SUBGOALS)
+        return (i / N_SUBGOALS) * MAX_ENV_STEPS
 
+    def advance(self, env_idx: int, obs: dict):
+        """Advance to the next stage and query the planner."""
+        next_stage = self.stage_indices[env_idx] + 1
+        if next_stage >= N_SUBGOALS:
+            # All stages done — keep a dummy subgoal, no more rewards
+            self.stage_indices[env_idx] = N_SUBGOALS
+            self.active_subgoals[env_idx] = "search for the goal"
+            self.step_counters[env_idx] = 0
+            return
+
+        uw = self.envs[env_idx].unwrapped
+        env_json = parse_env_description(obs["image"], uw.carrying)
+        subgoal, new_stage = self.planner.get_subgoal(
+            obs["mission"], env_json, obs.get("direction", 0),
+            stage_index=next_stage,
+        )
+        self.active_subgoals[env_idx] = subgoal
+        self.stage_indices[env_idx] = new_stage
+        self.step_counters[env_idx] = 0
+
+
+# ---------------------------------------------------------------------------
+# Observation preprocessing
+# ---------------------------------------------------------------------------
 
 def make_preprocess_obss(vocab, hierarchy_state, device=None):
     def preprocess_obss(obss, device=device):
@@ -149,8 +185,11 @@ def make_preprocess_obss(vocab, hierarchy_state, device=None):
             subgoal = (
                 hierarchy_state.active_subgoals[i]
                 if i < hierarchy_state.num_envs
-                else "explore"
+                else "search for the goal"
             )
+            # If subgoal is empty (before first init), use a placeholder
+            if not subgoal:
+                subgoal = "search for the key"
             combined = f"{obs['mission']} [SEP] {subgoal}"
             token_ids.append(vocab.tokenize(combined, max_len=32))
 
@@ -166,7 +205,14 @@ def make_env(env_name: str, seed: int):
     return env
 
 
-def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
+# ---------------------------------------------------------------------------
+# Reward shaping (stage-based, forward-only)
+# ---------------------------------------------------------------------------
+
+def make_reshape_reward(hierarchy_state, logger=None):
+    """Build the reward callback. Stage-based: each stage can only be
+    completed once per episode."""
+
     def reshape_reward(obs, action, reward, done):
         env_idx = reshape_reward._current_env_idx
         reshape_reward._current_env_idx = (env_idx + 1) % hierarchy_state.num_envs
@@ -174,16 +220,41 @@ def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
         total_reward = 0.0
         hierarchy_state.step_counters[env_idx] += 1
         hierarchy_state.episode_steps[env_idx] += 1
+        mission = obs.get("mission", "")
 
         if done:
-            if reward > 0:
+            success = reward > 0
+            if success:
                 t_total = hierarchy_state.episode_steps[env_idx]
                 ratio = min(t_total / MAX_ENV_STEPS, 1.0)
                 total_reward += R_MISSION * (1.0 - 0.5 * ratio)
+            if logger:
+                logger.on_episode_end(
+                    env_idx, mission, success,
+                    hierarchy_state.episode_steps[env_idx],
+                )
             hierarchy_state.reset_env(env_idx)
             return total_reward
 
-        uw = envs[env_idx].unwrapped
+        # If all stages exhausted, no subgoal checking
+        if hierarchy_state.stage_indices[env_idx] >= N_SUBGOALS:
+            return total_reward
+
+        # Initialize subgoal on first step if needed
+        if not hierarchy_state.active_subgoals[env_idx]:
+            hierarchy_state.init_env_subgoal(env_idx, obs)
+            if logger:
+                uw = hierarchy_state.envs[env_idx].unwrapped
+                env_json = parse_env_description(obs["image"], uw.carrying)
+                logger.log(
+                    env_idx, "init", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                )
+
+        uw = hierarchy_state.envs[env_idx].unwrapped
         subgoal = hierarchy_state.active_subgoals[env_idx]
         completed = hierarchy_state.trackers[env_idx].check_completion(
             subgoal, uw, action, obs_image=obs["image"],
@@ -196,32 +267,57 @@ def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
         if completed:
             ratio = min(t_used / max(t_budget, 1), 2.0)
             r_i = max(R_SUBGOAL * (1.0 - 0.5 * ratio), 0.0)
-            total_reward += r_i / N_SUBGOALS_EST
+            total_reward += r_i / N_SUBGOALS
 
             hierarchy_state.histories[env_idx].append(
-                {"subgoal": subgoal, "status": "Success", "steps": t_used}
+                {"subgoal": subgoal, "status": "Success", "steps": t_used,
+                 "stage": hierarchy_state.stage_indices[env_idx]}
             )
-            _log_subgoal_event(
-                subgoal_log, env_idx, "completed",
-                obs.get("mission", ""), subgoal,
-                t_used, t_budget, r_i / N_SUBGOALS_EST,
-            )
-            _advance_subgoal(
-                env_idx, uw, obs, hierarchy_state, planner, subgoal_log,
-            )
+            if logger:
+                logger.log(
+                    env_idx, "completed", mission=mission, subgoal=subgoal,
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    steps_used=t_used, budget=t_budget,
+                    reward=r_i / N_SUBGOALS,
+                )
+            hierarchy_state.advance(env_idx, obs)
+            if logger:
+                env_json = parse_env_description(
+                    obs["image"], hierarchy_state.envs[env_idx].unwrapped.carrying,
+                )
+                logger.log(
+                    env_idx, "new", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                    raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
+                )
 
         elif timed_out:
             hierarchy_state.histories[env_idx].append(
-                {"subgoal": subgoal, "status": "Failed", "steps": t_used}
+                {"subgoal": subgoal, "status": "Failed", "steps": t_used,
+                 "stage": hierarchy_state.stage_indices[env_idx]}
             )
-            _log_subgoal_event(
-                subgoal_log, env_idx, "timed_out",
-                obs.get("mission", ""), subgoal,
-                t_used, t_budget, 0.0,
-            )
-            _advance_subgoal(
-                env_idx, uw, obs, hierarchy_state, planner, subgoal_log,
-            )
+            if logger:
+                logger.log(
+                    env_idx, "timed_out", mission=mission, subgoal=subgoal,
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    steps_used=t_used, budget=t_budget,
+                )
+            hierarchy_state.advance(env_idx, obs)
+            if logger:
+                env_json = parse_env_description(
+                    obs["image"], hierarchy_state.envs[env_idx].unwrapped.carrying,
+                )
+                logger.log(
+                    env_idx, "new", mission=mission,
+                    subgoal=hierarchy_state.active_subgoals[env_idx],
+                    stage=hierarchy_state.stage_indices[env_idx],
+                    budget=hierarchy_state.subgoal_budget(env_idx),
+                    env_state=env_json,
+                    raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
+                )
 
         return total_reward
 
@@ -229,58 +325,9 @@ def make_reshape_reward(hierarchy_state, planner, envs, subgoal_log=None):
     return reshape_reward
 
 
-def _log_subgoal_event(
-    log_file, env_idx, event, mission, subgoal,
-    steps_used, budget, reward_given,
-    env_state=None, raw_llm=None,
-):
-    if log_file is None:
-        return
-    entry = {
-        "env": env_idx,
-        "event": event,
-        "mission": mission,
-        "subgoal": subgoal,
-        "valid": SubgoalTracker.is_recognized(subgoal),
-        "steps_used": steps_used,
-        "budget": round(budget, 1),
-        "reward": round(reward_given, 6),
-    }
-    if env_state is not None:
-        entry["env_state"] = env_state
-    if raw_llm is not None:
-        entry["raw_llm_response"] = raw_llm
-    log_file.write(json.dumps(entry) + "\n")
-    log_file.flush()
-
-
-def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner, subgoal_log=None):
-    env_json = parse_env_description(obs["image"], uw.carrying)
-    direction = obs.get("direction", 0)
-    hist = hierarchy_state.histories[env_idx]
-    past = [h["subgoal"] for h in hist]
-
-    new_subgoal = planner.get_subgoal(
-        obs["mission"],
-        env_json,
-        direction,
-        past,
-    )
-    raw = getattr(planner, "last_raw_response", None)
-
-    hierarchy_state.active_subgoals[env_idx] = new_subgoal
-    hierarchy_state.step_counters[env_idx] = 0
-    finished = (hist[-1]["subgoal"] if hist else "").strip().lower()
-    if finished != "explore":
-        hierarchy_state.subgoal_indices[env_idx] += 1
-
-    _log_subgoal_event(
-        subgoal_log, env_idx, "new",
-        obs.get("mission", ""), new_subgoal,
-        0, hierarchy_state.subgoal_budget(env_idx), 0.0,
-        env_state=env_json, raw_llm=raw,
-    )
-
+# ---------------------------------------------------------------------------
+# Plotting
+# ---------------------------------------------------------------------------
 
 def _smooth(values, window=20):
     if len(values) < window:
@@ -299,7 +346,7 @@ def save_plots(history, plot_dir):
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
     fig.suptitle(
-        "LGRL PPO (rule oracle) -- Training Curves",
+        "LGRL PPO (rule oracle, stage-based) -- Training Curves",
         fontsize=14, fontweight="bold",
     )
 
@@ -307,15 +354,13 @@ def save_plots(history, plot_dir):
     ax.plot(frames, history["avg_return"], alpha=0.3, color="tab:blue", linewidth=0.5)
     ax.plot(frames, _smooth(history["avg_return"]), color="tab:blue", linewidth=1.5, label="Smoothed")
     ax.set(xlabel="Frames", ylabel="Average Return", title="Average Return per Episode")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[0, 1]
     ax.plot(frames, history["avg_steps"], alpha=0.3, color="tab:orange", linewidth=0.5)
     ax.plot(frames, _smooth(history["avg_steps"]), color="tab:orange", linewidth=1.5, label="Smoothed")
     ax.set(xlabel="Frames", ylabel="Average Steps", title="Average Steps per Episode")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(); ax.grid(True, alpha=0.3)
 
     ax = axes[1, 0]
     ax.plot(frames, history["entropy"], color="tab:green", linewidth=1)
@@ -326,12 +371,10 @@ def save_plots(history, plot_dir):
     ax.plot(frames, _smooth(history["policy_loss"]), color="tab:red", linewidth=1.5, label="Policy Loss")
     ax.plot(frames, _smooth(history["value_loss"]), color="tab:purple", linewidth=1.5, label="Value Loss")
     ax.set(xlabel="Frames", ylabel="Loss", title="Policy & Value Loss")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.legend(); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plot_name = f"{ARTIFACT_STEM}_training_curves.png"
-    plt.savefig(os.path.join(plot_dir, plot_name), dpi=150)
+    plt.savefig(os.path.join(plot_dir, f"{ARTIFACT_STEM}_training_curves.png"), dpi=150)
     plt.close(fig)
 
 
@@ -361,6 +404,10 @@ def _load_history_from_csv(csv_path, csv_fields):
     return history
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     args = parse_args()
 
@@ -368,24 +415,23 @@ def main():
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{ARTIFACT_STEM}.pt")
 
     print("=" * 60)
-    print("  LGRL PPO Training (rule oracle) -- MiniGrid-DoorKey-5x5-v0")
+    print("  LGRL PPO Training (rule oracle, stage-based)")
+    print("  MiniGrid-DoorKey-5x5-v0")
     print("=" * 60)
     print(f"  Device         : {DEVICE}")
     print(f"  Envs           : {NUM_ENVS} parallel")
     print(f"  Frames         : {TOTAL_FRAMES:,}")
-    print(f"  Planner        : {PLANNER_TAG} (RuleBasedPlanner)")
+    print(f"  Planner        : {PLANNER_TAG} (stage-based, {N_SUBGOALS} stages)")
     print(f"  R_mission      : {R_MISSION}")
     print(f"  R_subgoal      : {R_SUBGOAL}")
-    print(f"  Subgoal budget : T_i = (i/{N_SUBGOALS_EST}) * {MAX_ENV_STEPS}")
-    print(f"  Metrics file   : {ARTIFACT_STEM}_metrics.csv")
-    print(f"  Checkpoint     : {ARTIFACT_STEM}.pt")
+    print(f"  Subgoal budget : T_i = ((stage+1)/{N_SUBGOALS}) * {MAX_ENV_STEPS}")
     print("=" * 60)
 
     envs = [make_env(ENV_NAME, seed=i) for i in range(NUM_ENVS)]
 
     vocab = Vocabulary()
     sample_obs, _ = gym.make(ENV_NAME).reset()
-    vocab.tokenize(f"{sample_obs['mission']} [SEP] explore", max_len=32)
+    vocab.tokenize(f"{sample_obs['mission']} [SEP] search for the yellow key", max_len=32)
 
     obs_space = envs[0].observation_space
     act_space = envs[0].action_space
@@ -396,18 +442,16 @@ def main():
     print(f"  Model params   : {sum(p.numel() for p in model.parameters()):,}")
     print("=" * 60)
 
-    hierarchy_state = HierarchyState(NUM_ENVS)
     planner = RuleBasedPlanner()
+    hierarchy_state = HierarchyState(NUM_ENVS, planner, envs)
 
-    subgoal_log_path = os.path.join(LOG_DIR, f"{ARTIFACT_STEM}_subgoal_log.jsonl")
-    subgoal_log = (
-        open(subgoal_log_path, "a", encoding="utf-8") if args.subgoal_log else None
+    logger = (
+        SubgoalLogger(LOG_DIR, ARTIFACT_STEM, NUM_ENVS)
+        if args.subgoal_log else None
     )
 
     preprocess_obss = make_preprocess_obss(vocab, hierarchy_state, device=DEVICE)
-    reshape_reward = make_reshape_reward(
-        hierarchy_state, planner, envs, subgoal_log=subgoal_log,
-    )
+    reshape_reward = make_reshape_reward(hierarchy_state, logger=logger)
 
     algo = torch_ac.PPOAlgo(
         envs=envs,
@@ -449,10 +493,6 @@ def main():
             raise SystemExit(
                 f"Checkpoint planner mismatch: expected {PLANNER_TAG!r}, got {saved!r}."
             )
-        if saved is None:
-            print(
-                "  Warning: checkpoint has no 'planner' field; resume only if this is a rule run.",
-            )
         model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             algo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -470,8 +510,8 @@ def main():
         csv_writer.writeheader()
 
     print(f"\n  Logging to : {csv_path}")
-    if subgoal_log is not None:
-        print(f"  Subgoal log: {subgoal_log_path}")
+    if logger is not None:
+        print(f"  Subgoal log: {logger.dir}/ (per-env files)")
     print(f"  Plots      : {PLOT_DIR}")
     print(
         f"\n{'Update':>7} | {'Frames':>10} | {'Avg Return':>11} | {'Avg Steps':>10} | "
@@ -501,14 +541,10 @@ def main():
         )
 
         row = {
-            "update": update,
-            "frames": total_frames,
-            "avg_return": f"{avg_return:.6f}",
-            "avg_steps": f"{avg_steps:.1f}",
-            "entropy": f"{entropy:.6f}",
-            "policy_loss": f"{policy_loss:.6f}",
-            "value_loss": f"{value_loss:.6f}",
-            "elapsed_sec": f"{elapsed:.1f}",
+            "update": update, "frames": total_frames,
+            "avg_return": f"{avg_return:.6f}", "avg_steps": f"{avg_steps:.1f}",
+            "entropy": f"{entropy:.6f}", "policy_loss": f"{policy_loss:.6f}",
+            "value_loss": f"{value_loss:.6f}", "elapsed_sec": f"{elapsed:.1f}",
         }
         csv_writer.writerow(row)
         csv_file.flush()
@@ -523,15 +559,13 @@ def main():
 
     _save_checkpoint(checkpoint_path, model, algo, vocab, update, total_frames)
     csv_file.close()
-    if subgoal_log is not None:
-        subgoal_log.close()
+    if logger is not None:
+        logger.close()
     save_plots(history, PLOT_DIR)
 
     print("\nTraining complete.")
     print(f"  Checkpoint : {checkpoint_path}")
     print(f"  Metrics    : {csv_path}")
-    if subgoal_log is not None:
-        print(f"  Subgoal log: {subgoal_log_path}")
     print(f"  Plots      : {PLOT_DIR}")
     print(f"  Updates: {update}, Frames: {total_frames:,}")
 

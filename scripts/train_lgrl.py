@@ -78,7 +78,7 @@ RECURRENCE      = 4
 R_MISSION       = 0.5
 R_SUBGOAL       = 0.5
 N_SUBGOALS_EST  = 5
-MAX_ENV_STEPS   = 100
+MAX_ENV_STEPS   = 250
 
 CHECKPOINT_DIR  = os.path.join(PROJECT_ROOT, "checkpoints")
 CHECKPOINT_EVERY = 10
@@ -146,8 +146,8 @@ class HierarchyState:
         self.episode_steps[env_idx]   = 0
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """T_i = (i / n) * T_max -- progressive budget that grows with subgoal index."""
-        i = self.subgoal_indices[env_idx]
+        """T_i = (i/n)*T_max from LGRL paper (Mathematics 2025, Eq. 6); i clamped to n."""
+        i = min(self.subgoal_indices[env_idx], N_SUBGOALS_EST)
         return (i / N_SUBGOALS_EST) * MAX_ENV_STEPS
 
 # ---------------------------------------------------------------------------
@@ -280,10 +280,11 @@ def _log_subgoal_event(log_file, env_idx, event, mission, subgoal,
 
 def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
                      subgoal_log=None):
-    """Query the planner for a new subgoal and advance the index."""
+    """Query the planner for a new subgoal and advance the paper subgoal index *i* when appropriate."""
     env_json = parse_env_description(obs["image"], uw.carrying)
     direction = obs.get("direction", 0)
-    past = [h["subgoal"] for h in hierarchy_state.histories[env_idx]]
+    hist = hierarchy_state.histories[env_idx]
+    past = [h["subgoal"] for h in hist]
 
     new_subgoal = planner.get_subgoal(obs["mission"], env_json, direction, past)
 
@@ -291,7 +292,9 @@ def _advance_subgoal(env_idx, uw, obs, hierarchy_state, planner,
 
     hierarchy_state.active_subgoals[env_idx] = new_subgoal
     hierarchy_state.step_counters[env_idx] = 0
-    hierarchy_state.subgoal_indices[env_idx] += 1
+    finished = (hist[-1]["subgoal"] if hist else "").strip().lower()
+    if finished != "explore":
+        hierarchy_state.subgoal_indices[env_idx] += 1
 
     _log_subgoal_event(subgoal_log, env_idx, "new",
                        obs.get("mission", ""), new_subgoal,

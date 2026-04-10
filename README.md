@@ -109,8 +109,9 @@ The agent operates in a bi-level hierarchy:
 |--------|---------|-------|
 | Mission reward | `r_m = R_m * (1 - 0.5 * T_used / T_max)` | R_m = 0.5 |
 | Subgoal reward | `r_i = R_t * (1 - 0.5 * T_used / T_i)` | R_t = 0.5 |
-| Subgoal budget | `T_i = (i / n) * T_max` | n = 5, T_max = 100 |
+| Subgoal budget | `T_i = (i / n) * T_max` | n = 5, T_max = 250|
 | Episode total  | `r = r_m + (1/n) * sum(r_i)` | |
+
 
 ## Tech Stack
 

@@ -71,12 +71,14 @@ EPOCHS = 4
 BATCH_SIZE = 256
 RECURRENCE = 4
 
-R_MISSION = 0.5
-R_SUBGOAL = 0.5
-MISSION_TIME_COEF = 0.5          # coefficient in mission reward penalty
+R_MISSION = 0.5                  # max mission reward 
+R_SUBGOAL = 0.5                  # max per-subgoal reward 
+MISSION_TIME_COEF = 0.5          # time penalty steepness for mission 
+SUBGOAL_TIME_COEF = 0.5          # time penalty steepness for subgoals 
 N_SUBGOALS = RuleBasedPlanner.NUM_STAGES  # 5 stages
 MAX_ENV_STEPS = 250              # T_max for mission reward scaling
 MAX_SUBGOAL_STEPS = 250          # T_max for subgoal budget calculation
+SUBGOAL_TIMEOUT_MULT = 2.0       # subgoal times out when steps > mult * T_i
 
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 CHECKPOINT_EVERY = 10
@@ -264,11 +266,11 @@ def make_reshape_reward(hierarchy_state, logger=None):
 
         t_used = hierarchy_state.step_counters[env_idx]
         t_budget = hierarchy_state.subgoal_budget(env_idx)
-        timed_out = t_used > 2 * t_budget
+        timed_out = t_used > SUBGOAL_TIMEOUT_MULT * t_budget
 
         if completed:
-            ratio = min(t_used / max(t_budget, 1), 2.0)
-            r_i = max(R_SUBGOAL * (1.0 - 0.5 * ratio), 0.0)
+            ratio = min(t_used / max(t_budget, 1), SUBGOAL_TIMEOUT_MULT)
+            r_i = max(R_SUBGOAL * (1.0 - SUBGOAL_TIME_COEF * ratio), 0.0)
             total_reward += r_i / N_SUBGOALS
 
             hierarchy_state.histories[env_idx].append(

@@ -111,7 +111,7 @@ The agent operates in a bi-level hierarchy:
 - **High level:** A planner (LLM or rule-based oracle) observes the environment state as a JSON description and generates the next subgoal (e.g. "pickup the yellow key").
 - **Low level:** A recurrent PPO agent receives the concatenated text `"mission [SEP] subgoal"` alongside the visual observation and selects low-level actions.
 
-### Subgoal Types
+### Subgoal Types 
 
 Only these subgoal forms are used:
 
@@ -137,14 +137,30 @@ The rule-based planner implements a forward-only 5-stage machine. Stages whose p
 
 ### Reward Scaffolding
 
-| Symbol | Formula | Value |
-|--------|---------|-------|
-| Mission reward | `r_m = R_m * (1 - 0.5 * T_used / T_max)` | R_m = 0.5 |
-| Subgoal reward | `r_i = R_t * (1 - 0.5 * T_used / T_i)` | R_t = 0.5 |
-| Subgoal budget | `T_i = ((stage+1) / n) * T_subgoal_max` | n = 5, T_subgoal_max = 250 |
-| Episode total  | `r = r_m + (1/n) * sum(r_i)` | |
+| Symbol | Formula | Default |
+|--------|---------|---------|
+| Mission reward | `r_m = R_MISSION * (1 - MISSION_TIME_COEF * T_used / MAX_ENV_STEPS)` | 0.5 * (1 - 0.5 * ratio) |
+| Subgoal reward | `r_i = R_SUBGOAL * (1 - SUBGOAL_TIME_COEF * T_used / T_i)` | 0.5 * (1 - 0.5 * ratio) |
+| Subgoal budget | `T_i = ((stage+1) / N_SUBGOALS) * MAX_SUBGOAL_STEPS` | (stage+1)/5 * 250 |
+| Subgoal timeout | `T_used > SUBGOAL_TIMEOUT_MULT * T_i` | 2.0 * T_i |
+| Episode total  | `r = r_m + (1/N_SUBGOALS) * sum(r_i)` | |
 
-If `T_used > 2 * T_i`, the subgoal reward is 0 and the agent advances to the next stage. `T_max` (mission reward) and `T_subgoal_max` (subgoal budget) are configured independently to allow tuning subgoal budgets without affecting the mission reward curve.
+If a subgoal times out, its reward is 0 and the agent advances to the next stage. Maximum possible episode reward is `R_MISSION + R_SUBGOAL = 1.0` (when all subgoals and the mission are completed instantly).
+
+### Reward & Budget Configuration
+
+All reward-shaping parameters are defined at the top of `train_lgrl.py` and `train_lgrl_rule.py`. They are kept consistent across both scripts.
+
+| Parameter | Default | Description | Dependencies / notes |
+|-----------|---------|-------------|----------------------|
+| `R_MISSION` | 0.5 | Max mission-completion reward | `R_MISSION + R_SUBGOAL` sets the theoretical max episode return (1.0 by default) |
+| `R_SUBGOAL` | 0.5 | Max per-subgoal reward (before 1/n normalization) | See above |
+| `MISSION_TIME_COEF` | 0.5 | Steepness of mission time penalty (paper Eq. 5) | At 0.5 an agent finishing at `T_max` still gets 0.25 mission reward; at 0.9 it gets only 0.05 |
+| `SUBGOAL_TIME_COEF` | 0.5 | Steepness of subgoal time penalty (paper Eq. 6) | Higher values punish slow subgoal completion more aggressively |
+| `MAX_ENV_STEPS` | 250 | `T_max` used in the mission reward ratio | Only affects mission reward; independent of subgoal budgets |
+| `MAX_SUBGOAL_STEPS` | 250 | `T_max` used in subgoal budget calculation `T_i` | Increase to give the agent more time per subgoal without changing mission reward |
+| `SUBGOAL_TIMEOUT_MULT` | 2.0 | Subgoal times out when `steps > mult * T_i` | Also caps the ratio in the subgoal reward formula |
+| `N_SUBGOALS` | 5 | Number of stages (derived from `RuleBasedPlanner.NUM_STAGES`) | Changing this requires modifying the planner's stage machine |
 
 ### Subgoal Logging
 

@@ -73,8 +73,10 @@ RECURRENCE = 4
 
 R_MISSION = 0.5
 R_SUBGOAL = 0.5
+MISSION_TIME_COEF = 0.5          # coefficient in mission reward penalty
 N_SUBGOALS = RuleBasedPlanner.NUM_STAGES  # 5 stages
-MAX_ENV_STEPS = 250
+MAX_ENV_STEPS = 250              # T_max for mission reward scaling
+MAX_SUBGOAL_STEPS = 250          # T_max for subgoal budget calculation
 
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 CHECKPOINT_EVERY = 10
@@ -147,7 +149,7 @@ class HierarchyState:
     def subgoal_budget(self, env_idx: int) -> float:
         """T_i = (i/n) * T_max  (paper Eq. 6), using 1-indexed stage."""
         i = min(self.stage_indices[env_idx] + 1, N_SUBGOALS)
-        return (i / N_SUBGOALS) * MAX_ENV_STEPS
+        return (i / N_SUBGOALS) * MAX_SUBGOAL_STEPS
 
     def advance(self, env_idx: int, obs: dict):
         """Advance to the next stage and query the planner."""
@@ -227,7 +229,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
             if success:
                 t_total = hierarchy_state.episode_steps[env_idx]
                 ratio = min(t_total / MAX_ENV_STEPS, 1.0)
-                total_reward += R_MISSION * (1.0 - 0.5 * ratio)
+                total_reward += R_MISSION * (1.0 - MISSION_TIME_COEF * ratio)
             if logger:
                 logger.on_episode_end(
                     env_idx, mission, success,
@@ -424,7 +426,7 @@ def main():
     print(f"  Planner        : {PLANNER_TAG} (stage-based, {N_SUBGOALS} stages)")
     print(f"  R_mission      : {R_MISSION}")
     print(f"  R_subgoal      : {R_SUBGOAL}")
-    print(f"  Subgoal budget : T_i = ((stage+1)/{N_SUBGOALS}) * {MAX_ENV_STEPS}")
+    print(f"  Subgoal budget : T_i = ((stage+1)/{N_SUBGOALS}) * {MAX_SUBGOAL_STEPS}")
     print("=" * 60)
 
     envs = [make_env(ENV_NAME, seed=i) for i in range(NUM_ENVS)]

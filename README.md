@@ -2,6 +2,7 @@
 
 This repository contains the codebase for our CMPE 492 Senior Project at Bogazici University. We implement and evaluate an LLM-assisted hierarchical reinforcement learning architecture where a large language model decomposes high-level missions into subgoals that guide a PPO agent's exploration and decision-making in interactive grid-world environments.
 
+
 **Team:** Onur Kucuk & Yusuf Akdogan
 **Advisor:** Emre Ugur
 
@@ -20,15 +21,17 @@ Official project documentation, timeline, and milestones are in the [Repository 
 ├── scripts/
 │   ├── train_baseline.py       # Baseline PPO training (no subgoal guidance)
 │   ├── train_lgrl.py           # LGRL training (LLM planner by default)
-│   └── train_lgrl_rule.py      # LGRL rule oracle (standalone script; own training loop)
+│   └── train_lgrl_rule.py      # LGRL rule oracle (standalone script)
 ├── utils/
 │   ├── __init__.py
 │   ├── env_parser.py           # MiniGrid 7x7 observation -> JSON for the LLM
 │   ├── llm_planner.py          # LLM subgoal generation (Ollama / Qwen 2.5 7B)
-│   ├── rule_based_planner.py   # Oracle ablation baseline (deterministic subgoals)
-│   └── subgoal_tracker.py      # Subgoal completion verification
+│   ├── rule_based_planner.py   # Stage-based deterministic oracle planner
+│   ├── subgoal_tracker.py      # Subgoal completion verification
+│   ├── subgoal_logger.py       # Per-environment JSONL subgoal logging
+│   └── sequential_env.py       # Single-process env stepper for torch-ac
 ├── checkpoints/                # Saved model weights (git-ignored)
-├── logs/                       # Metrics CSV & plots (git-ignored)
+├── logs/                       # Metrics CSV, plots & subgoal logs (git-ignored)
 ├── requirements.txt
 └── .gitignore
 ```
@@ -70,31 +73,36 @@ The LLM (Qwen 2.5 7B via Ollama) generates subgoals at each decision point durin
 
 ```bash
 python scripts/train_lgrl.py
+python scripts/train_lgrl.py --subgoal-log          # enable per-env subgoal logging
+python scripts/train_lgrl.py --planner rule_based   # oracle ablation via same script
+python scripts/train_lgrl.py --resume               # resume from checkpoint
 ```
 
 | Artifact | Path |
 |----------|------|
-| Metrics CSV | `logs/lgrl_llm_metrics.csv` |
-| Checkpoint | `checkpoints/lgrl_llm.pt` |
-| Plot | `logs/plots/lgrl_llm_training_curves.png` |
-| Subgoal log (with `--subgoal-log`) | `logs/lgrl_llm_subgoal_log.jsonl` |
+| Metrics CSV | `logs/lgrl_metrics.csv` |
+| Checkpoint | `checkpoints/lgrl.pt` |
+| Plot | `logs/plots/lgrl_training_curves.png` |
+| Subgoal logs (with `--subgoal-log`) | `logs/lgrl_subgoal_log/env_00.jsonl` … `env_15.jsonl` |
 
 ### LGRL with rule-based oracle (ablation)
 
-A deterministic planner that produces the same subgoal string format as the LLM using hand-coded heuristics. Isolates LLM quality from hierarchical reward and text conditioning. Same PPO loop and `LGRLAgent` as the LLM run.
+A stage-based deterministic planner that produces the same subgoal format as the LLM using hand-coded heuristics. Isolates LLM quality from hierarchical reward and text conditioning. Same PPO loop and `LGRLAgent` as the LLM run.
 
 ```bash
 python scripts/train_lgrl_rule.py
+python scripts/train_lgrl_rule.py --subgoal-log     # enable per-env subgoal logging
+python scripts/train_lgrl_rule.py --resume           # resume from checkpoint
 ```
 
-Rule training uses this script only (it does not import `train_lgrl.py`). For LLM training use `train_lgrl.py` (optionally `--planner rule_based` still works there if you prefer one file for both).
+Rule training uses this script only (it does not import `train_lgrl.py`).
 
 | Artifact | Path |
 |----------|------|
 | Metrics CSV | `logs/lgrl_rule_metrics.csv` |
 | Checkpoint | `checkpoints/lgrl_rule.pt` |
 | Plot | `logs/plots/lgrl_rule_training_curves.png` |
-| Subgoal log (with `--subgoal-log`) | `logs/lgrl_rule_subgoal_log.jsonl` |
+| Subgoal logs (with `--subgoal-log`) | `logs/lgrl_rule_subgoal_log/env_00.jsonl` … `env_15.jsonl` |
 
 ## Architecture
 
@@ -103,15 +111,54 @@ The agent operates in a bi-level hierarchy:
 - **High level:** A planner (LLM or rule-based oracle) observes the environment state as a JSON description and generates the next subgoal (e.g. "pickup the yellow key").
 - **Low level:** A recurrent PPO agent receives the concatenated text `"mission [SEP] subgoal"` alongside the visual observation and selects low-level actions.
 
+### Subgoal Types
+
+Only these subgoal forms are used:
+
+| Subgoal | Format | Example |
+|---------|--------|---------|
+| Search | `search for the [color] [object]` | `search for the yellow key` |
+| Pickup | `pickup the [color] [object]` | `pickup the yellow key` |
+| Open | `open the [status] [color] door` | `open the locked yellow door` |
+| Close | `close the [status] [color] door` | `close the open yellow door` |
+| Drop | `drop the [color] [object]` | `drop the yellow key` |
+
+### Stage-Based Subgoal Progression (DoorKey-5x5)
+
+The rule-based planner implements a forward-only 5-stage machine. Stages whose preconditions are already met are automatically skipped:
+
+| Stage | Subgoal | Skipped if… |
+|-------|---------|-------------|
+| 0 | `search for the [color] key` | Key already visible → jump to stage 1 |
+| 1 | `pickup the [color] key` | Already carrying key → jump to stage 2 |
+| 2 | `search for the [color] door` | Door already visible → jump to stage 3 |
+| 3 | `open the locked [color] door` | Door already open → jump to stage 4 |
+| 4 | `search for the goal` | — |
+
 ### Reward Scaffolding
 
 | Symbol | Formula | Value |
 |--------|---------|-------|
 | Mission reward | `r_m = R_m * (1 - 0.5 * T_used / T_max)` | R_m = 0.5 |
 | Subgoal reward | `r_i = R_t * (1 - 0.5 * T_used / T_i)` | R_t = 0.5 |
-| Subgoal budget | `T_i = (i / n) * T_max` | n = 5, T_max = 250|
+| Subgoal budget | `T_i = ((stage+1) / n) * T_subgoal_max` | n = 5, T_subgoal_max = 250 |
 | Episode total  | `r = r_m + (1/n) * sum(r_i)` | |
 
+If `T_used > 2 * T_i`, the subgoal reward is 0 and the agent advances to the next stage. `T_max` (mission reward) and `T_subgoal_max` (subgoal budget) are configured independently to allow tuning subgoal budgets without affecting the mission reward curve.
+
+### Subgoal Logging
+
+When `--subgoal-log` is enabled, per-environment JSONL files are written under `logs/<stem>_subgoal_log/`. Each file traces the full subgoal lifecycle for that environment:
+
+| Event | When | Key fields |
+|-------|------|------------|
+| `init` | First subgoal assigned at episode start | `subgoal`, `stage`, `env_state` |
+| `completed` | Subgoal verified as done | `steps_used`, `budget`, `reward` |
+| `timed_out` | Budget exceeded (2×T_i steps) | `steps_used`, `budget` |
+| `new` | Next subgoal issued | `subgoal`, `stage`, `env_state`, `raw_llm` |
+| `episode_end` | Episode terminates | `success`, `episode_steps` |
+
+Each line includes a timestamp and episode counter for grouping.
 
 ## Tech Stack
 

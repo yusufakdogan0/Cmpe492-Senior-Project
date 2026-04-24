@@ -39,7 +39,7 @@ NUM_ENVS           = 16          # parallel environments
 NUM_FRAMES_PER_PROC = 128        # rollout length per env per update
 TOTAL_FRAMES       = 10_000_000  # total training budget
 
-# PPO hyperparameters (from the LGRL paper)
+# PPO hyperparameters
 LR                 = 1e-4
 DISCOUNT           = 0.99
 GAE_LAMBDA         = 0.95

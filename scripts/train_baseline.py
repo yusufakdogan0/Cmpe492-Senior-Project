@@ -54,7 +54,7 @@ from utils.env_utils import (
 DEFAULT_ENV        = LEGACY_DEFAULT_ENV
 NUM_ENVS           = 16          # parallel environments
 NUM_FRAMES_PER_PROC = 128        # rollout length per env per update
-TOTAL_FRAMES       = 20_000_000  # total training budget
+TOTAL_FRAMES       = 50_000_000  # total training budget
 
 # PPO hyperparameters
 LR                 = 1e-4

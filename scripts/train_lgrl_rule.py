@@ -4,8 +4,9 @@ LGRL PPO training with the rule-based oracle planner only.
 Stage-based hierarchy: the planner produces a fixed forward-only sequence
 of subgoals matching the LGRL paper. No "explore" or "go to" subgoals.
 
-Supports three environment families:
+Supports four environment families:
   - MiniGrid-DoorKey-5x5-v0              (5 stages)
+  - MiniGrid-UnlockPickup-v0             (6 stages)
   - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0   (1 stage)
   - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (1 stage)
 
@@ -17,6 +18,7 @@ Artifact naming:
 
 Usage:
     python scripts/train_lgrl_rule.py
+    python scripts/train_lgrl_rule.py --env MiniGrid-UnlockPickup-v0
     python scripts/train_lgrl_rule.py --env MiniGrid-GoToDoor-5x5-v0
     python scripts/train_lgrl_rule.py --env MiniGrid-GoToObject-6x6-N2-v0
     python scripts/train_lgrl_rule.py --resume
@@ -70,7 +72,7 @@ from utils.subgoal_logger import SubgoalLogger
 DEFAULT_ENV = LEGACY_DEFAULT_ENV
 NUM_ENVS = 16
 NUM_FRAMES_PER_PROC = 128
-TOTAL_FRAMES = 20_000_000
+TOTAL_FRAMES = 50_000_000
 
 # PPO hyperparameters from LGRL paper (Section 4.3)
 LR = 1e-4

@@ -20,6 +20,7 @@ import minigrid  # noqa: F401  (registers MiniGrid envs)
 # but are not listed here as "officially supported".
 SUPPORTED_ENVS: tuple[str, ...] = (
     "MiniGrid-DoorKey-5x5-v0",
+    "MiniGrid-UnlockPickup-v0",
     "MiniGrid-GoToDoor-5x5-v0",
     "MiniGrid-GoToDoor-6x6-v0",
     "MiniGrid-GoToDoor-8x8-v0",

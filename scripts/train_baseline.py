@@ -1,27 +1,39 @@
 """
-train_baseline.py — PPO training on MiniGrid-DoorKey-5x5-v0.
+train_baseline.py — Baseline PPO (no subgoal guidance) for MiniGrid.
 
-This is the baseline (no LLM subgoals). Trains a standard recurrent
-PPO agent as the control condition for comparison with the LGRL agent.
+Standard recurrent PPO agent conditioned only on the mission string.
+Used as the control condition for comparison with the LGRL agent.
+
+Supported environments:
+  - MiniGrid-DoorKey-5x5-v0              (legacy default)
+  - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0
+  - MiniGrid-GoToObject-{6x6,8x8}-N2-v0
+
+Artifact naming:
+  - DoorKey-5x5 keeps base names:  baseline.pt, baseline_metrics.csv, training_curves.png
+  - Other envs are suffixed:       baseline_gotodoor5x5.pt, baseline_gotodoor5x5_metrics.csv, etc.
+
+Hyperparams:
+    lr=1e-4, gamma=0.99, gae_lambda=0.95, clip=0.2, batch_size=256
 
 Usage:
     python scripts/train_baseline.py
-
-Hyperparams follow the LGRL paper:
-    lr=1e-4, gamma=0.99, gae_lambda=0.95, clip=0.2,
-    entropy_coef=0.01, value_coef=0.5
+    python scripts/train_baseline.py --env MiniGrid-GoToDoor-5x5-v0
+    python scripts/train_baseline.py --env MiniGrid-GoToObject-6x6-N2-v0
 """
 
+import argparse
+import csv
 import os
 import sys
-import csv
 import time
+
 import numpy as np
 import torch
 import gymnasium as gym
-import minigrid                  # registers MiniGrid envs with gymnasium
+import minigrid  # noqa: F401  (registers MiniGrid envs with gymnasium)
 import matplotlib
-matplotlib.use("Agg")            # headless backend for saving plots
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 # resolve project root so imports work from scripts/
@@ -31,41 +43,62 @@ sys.path.insert(0, PROJECT_ROOT)
 import torch_ac
 
 from models.baseline_agent import BaselineAgent, Vocabulary
+from utils.env_utils import (
+    SUPPORTED_ENVS,
+    LEGACY_DEFAULT_ENV,
+    resolve_artifact_stem,
+)
 
-# --- Config ---
+# --- Static config -----------------------------------------------------
 
-ENV_NAME           = "MiniGrid-DoorKey-5x5-v0"
+DEFAULT_ENV        = LEGACY_DEFAULT_ENV
 NUM_ENVS           = 16          # parallel environments
 NUM_FRAMES_PER_PROC = 128        # rollout length per env per update
-TOTAL_FRAMES       = 10_000_000  # total training budget
+TOTAL_FRAMES       = 20_000_000  # total training budget
 
 # PPO hyperparameters
 LR                 = 1e-4
 DISCOUNT           = 0.99
 GAE_LAMBDA         = 0.95
 CLIP_EPS           = 0.2
+BATCH_SIZE         = 256
+# Not specified in the paper
 ENTROPY_COEF       = 0.01
 VALUE_LOSS_COEF    = 0.5
 MAX_GRAD_NORM      = 0.5
-EPOCHS             = 4           # PPO update epochs
-BATCH_SIZE         = 256
-RECURRENCE         = 4           # BPTT window
+EPOCHS             = 4
+RECURRENCE         = 4
 
 CHECKPOINT_DIR     = os.path.join(PROJECT_ROOT, "checkpoints")
-CHECKPOINT_EVERY   = 10          # save every N updates
-CHECKPOINT_PATH    = os.path.join(CHECKPOINT_DIR, "baseline.pt")
+CHECKPOINT_EVERY   = 10
 
 LOG_DIR            = os.path.join(PROJECT_ROOT, "logs")
-CSV_PATH           = os.path.join(LOG_DIR, "baseline_metrics.csv")
 PLOT_DIR           = os.path.join(LOG_DIR, "plots")
-PLOT_EVERY         = 50          # regenerate plots every N updates
+PLOT_EVERY         = 50
+
+BASE_ARTIFACT_STEM = "baseline"
+# DoorKey-5x5 retains the legacy plot filename "training_curves.png" for
+# compatibility with existing project documentation.
+LEGACY_PLOT_NAME   = "training_curves.png"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# --- Observation preprocessing ---
-# MiniGrid gives us dicts with 'image', 'direction', 'mission'.
-# torch-ac expects tensors, so we convert here.
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train the baseline PPO agent (no subgoal guidance)."
+    )
+    parser.add_argument(
+        "--env",
+        default=DEFAULT_ENV,
+        choices=SUPPORTED_ENVS,
+        help=f"MiniGrid environment id (default: {DEFAULT_ENV})",
+    )
+    parser.add_argument("--resume", action="store_true")
+    return parser.parse_args()
+
+
+# --- Observation preprocessing ----------------------------------------
 
 def make_preprocess_obss(vocab, device=None):
     """Returns a function that converts raw obs dicts into model-ready tensors."""
@@ -87,97 +120,106 @@ def make_preprocess_obss(vocab, device=None):
     return preprocess_obss
 
 
-# --- Env factory ---
+# --- Env factory -------------------------------------------------------
 
 def make_env(env_name, seed):
-    """Create a single MiniGrid environment."""
     env = gym.make(env_name)
     env.reset(seed=seed)
     return env
 
 
-# --- Plotting helpers ---
+# --- Plotting helpers --------------------------------------------------
 
 def _smooth(values, window=20):
-    """Simple rolling average."""
     if len(values) < window:
         return values
     smoothed = []
     for i in range(len(values)):
         start = max(0, i - window + 1)
-        smoothed.append(sum(values[start:i+1]) / (i - start + 1))
+        smoothed.append(sum(values[start:i + 1]) / (i - start + 1))
     return smoothed
 
 
-def save_plots(history, plot_dir):
-    """Generate and save the four training curve subplots."""
+def save_plots(history, plot_dir, plot_filename, env_name):
     frames = history["frames"]
     if len(frames) < 2:
         return
 
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle("Baseline PPO — Training Curves", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"Baseline PPO — {env_name}", fontsize=14, fontweight="bold"
+    )
 
-    # return
     ax = axes[0, 0]
     ax.plot(frames, history["avg_return"], alpha=0.3, color="tab:blue", linewidth=0.5)
     ax.plot(frames, _smooth(history["avg_return"]), color="tab:blue", linewidth=1.5, label="Smoothed")
-    ax.set_xlabel("Frames")
-    ax.set_ylabel("Average Return")
-    ax.set_title("Average Return per Episode")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.set(xlabel="Frames", ylabel="Average Return", title="Average Return per Episode")
+    ax.legend(); ax.grid(True, alpha=0.3)
 
-    # steps
     ax = axes[0, 1]
     ax.plot(frames, history["avg_steps"], alpha=0.3, color="tab:orange", linewidth=0.5)
     ax.plot(frames, _smooth(history["avg_steps"]), color="tab:orange", linewidth=1.5, label="Smoothed")
-    ax.set_xlabel("Frames")
-    ax.set_ylabel("Average Steps")
-    ax.set_title("Average Steps per Episode")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.set(xlabel="Frames", ylabel="Average Steps", title="Average Steps per Episode")
+    ax.legend(); ax.grid(True, alpha=0.3)
 
-    # entropy
     ax = axes[1, 0]
     ax.plot(frames, history["entropy"], color="tab:green", linewidth=1)
-    ax.set_xlabel("Frames")
-    ax.set_ylabel("Entropy")
-    ax.set_title("Policy Entropy")
+    ax.set(xlabel="Frames", ylabel="Entropy", title="Policy Entropy")
     ax.grid(True, alpha=0.3)
 
-    # losses
     ax = axes[1, 1]
     ax.plot(frames, _smooth(history["policy_loss"]), color="tab:red", linewidth=1.5, label="Policy Loss")
     ax.plot(frames, _smooth(history["value_loss"]), color="tab:purple", linewidth=1.5, label="Value Loss")
-    ax.set_xlabel("Frames")
-    ax.set_ylabel("Loss")
-    ax.set_title("Policy & Value Loss")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.set(xlabel="Frames", ylabel="Loss", title="Policy & Value Loss")
+    ax.legend(); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "training_curves.png"), dpi=150)
+    plt.savefig(os.path.join(plot_dir, plot_filename), dpi=150)
     plt.close(fig)
 
 
-# --- Main training loop ---
+# --- Main training loop -----------------------------------------------
+
+def _load_history_from_csv(csv_path, csv_fields):
+    history = {k: [] for k in csv_fields}
+    if not os.path.exists(csv_path):
+        return history
+    with open(csv_path, "r", newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for k in csv_fields:
+                history[k].append(float(row[k]))
+    return history
+
 
 def main():
+    args = parse_args()
+    env_name = args.env
+
+    artifact_stem = resolve_artifact_stem(BASE_ARTIFACT_STEM, env_name)
+    csv_path = os.path.join(LOG_DIR, f"{artifact_stem}_metrics.csv")
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{artifact_stem}.pt")
+    # Preserve the legacy plot filename for DoorKey-5x5
+    if env_name == LEGACY_DEFAULT_ENV:
+        plot_filename = LEGACY_PLOT_NAME
+    else:
+        plot_filename = f"{artifact_stem}_training_curves.png"
+
     print("=" * 60)
-    print("  Baseline PPO Training — MiniGrid-DoorKey-5x5-v0")
+    print(f"  Baseline PPO Training — {env_name}")
     print("=" * 60)
-    print(f"  Device : {DEVICE}")
-    print(f"  Envs   : {NUM_ENVS} parallel")
-    print(f"  Frames : {TOTAL_FRAMES:,}")
+    print(f"  Artifact stem : {artifact_stem}")
+    print(f"  Device        : {DEVICE}")
+    print(f"  Envs          : {NUM_ENVS} parallel")
+    print(f"  Frames        : {TOTAL_FRAMES:,}")
     print("=" * 60)
 
     # create parallel environments
-    envs = [make_env(ENV_NAME, seed=i) for i in range(NUM_ENVS)]
+    envs = [make_env(env_name, seed=i) for i in range(NUM_ENVS)]
 
     # build vocabulary (pre-seed with one mission to populate common words)
     vocab = Vocabulary()
-    sample_obs, _ = gym.make(ENV_NAME).reset()
+    sample_obs, _ = gym.make(env_name).reset()
     vocab.tokenize(sample_obs["mission"])
 
     # build model
@@ -221,70 +263,83 @@ def main():
     frames_per_update = NUM_ENVS * NUM_FRAMES_PER_PROC
     start_time = time.time()
 
-    # CSV logger
-    csv_fields = ["update", "frames", "avg_return", "avg_steps",
-                  "entropy", "policy_loss", "value_loss", "elapsed_sec"]
-    csv_file = open(CSV_PATH, "w", newline="")
-    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
-    csv_writer.writeheader()
+    csv_fields = [
+        "update", "frames", "avg_return", "avg_steps",
+        "entropy", "policy_loss", "value_loss", "elapsed_sec",
+    ]
 
-    # keep history in memory for plotting
-    history = {k: [] for k in csv_fields}
+    # Resume or fresh start
+    if args.resume and os.path.exists(checkpoint_path):
+        ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+        saved_env = ckpt.get("env")
+        if saved_env is not None and saved_env != env_name:
+            raise SystemExit(
+                f"Checkpoint env mismatch: expected {env_name!r}, got {saved_env!r}."
+            )
+        model.load_state_dict(ckpt["model_state_dict"])
+        update = ckpt.get("update", 0)
+        total_frames = ckpt.get("total_frames", 0)
+        print(f"  Resumed from checkpoint: update={update}, frames={total_frames:,}")
+        history = _load_history_from_csv(csv_path, csv_fields)
+        csv_file = open(csv_path, "a", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+    else:
+        history = {k: [] for k in csv_fields}
+        csv_file = open(csv_path, "w", newline="")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=csv_fields)
+        csv_writer.writeheader()
 
-    print(f"\n  Logging to  : {CSV_PATH}")
-    print(f"  Plots saved : {PLOT_DIR}")
-    print(f"\n{'Update':>7} | {'Frames':>10} | {'Avg Return':>11} | {'Avg Steps':>10} | "
-          f"{'Entropy':>8} | {'Policy Loss':>12} | {'Value Loss':>11}")
+    print(f"\n  Logging to  : {csv_path}")
+    print(f"  Plots saved : {os.path.join(PLOT_DIR, plot_filename)}")
+    print(
+        f"\n{'Update':>7} | {'Frames':>10} | {'Avg Return':>11} | {'Avg Steps':>10} | "
+        f"{'Entropy':>8} | {'Policy Loss':>12} | {'Value Loss':>11}"
+    )
     print("-" * 90)
 
     while total_frames < TOTAL_FRAMES:
         update += 1
         total_frames += frames_per_update
 
-        # collect rollouts
         exps, collect_logs = algo.collect_experiences()
-
-        # PPO update
         update_logs = algo.update_parameters(exps)
 
-        # stats
-        avg_return = np.mean(collect_logs["return_per_episode"])
-        avg_steps  = np.mean(collect_logs["num_frames_per_episode"])
-        entropy    = np.mean(update_logs["entropy"])
+        avg_return  = np.mean(collect_logs["return_per_episode"])
+        avg_steps   = np.mean(collect_logs["num_frames_per_episode"])
+        entropy     = np.mean(update_logs["entropy"])
         policy_loss = np.mean(update_logs["policy_loss"])
-        value_loss = np.mean(update_logs["value_loss"])
+        value_loss  = np.mean(update_logs["value_loss"])
+        elapsed     = time.time() - start_time
 
-        elapsed = time.time() - start_time
+        print(
+            f"{update:>7} | {total_frames:>10,} | {avg_return:>11.3f} | "
+            f"{avg_steps:>10.1f} | {entropy:>8.4f} | {policy_loss:>12.4f} | "
+            f"{value_loss:>11.4f}"
+        )
 
-        # console output
-        print(f"{update:>7} | {total_frames:>10,} | {avg_return:>11.3f} | "
-              f"{avg_steps:>10.1f} | {entropy:>8.4f} | {policy_loss:>12.4f} | "
-              f"{value_loss:>11.4f}")
-
-        # write to CSV
-        row = {"update": update, "frames": total_frames,
-               "avg_return": f"{avg_return:.6f}", "avg_steps": f"{avg_steps:.1f}",
-               "entropy": f"{entropy:.6f}", "policy_loss": f"{policy_loss:.6f}",
-               "value_loss": f"{value_loss:.6f}", "elapsed_sec": f"{elapsed:.1f}"}
+        row = {
+            "update": update, "frames": total_frames,
+            "avg_return": f"{avg_return:.6f}", "avg_steps": f"{avg_steps:.1f}",
+            "entropy": f"{entropy:.6f}", "policy_loss": f"{policy_loss:.6f}",
+            "value_loss": f"{value_loss:.6f}", "elapsed_sec": f"{elapsed:.1f}",
+        }
         csv_writer.writerow(row)
         csv_file.flush()
-
         for k, v in row.items():
             history[k].append(float(v))
 
-        # periodic checkpoint
         if update % CHECKPOINT_EVERY == 0:
             torch.save({
                 "model_state_dict": model.state_dict(),
                 "vocab": vocab.word2idx,
                 "update": update,
                 "total_frames": total_frames,
-            }, CHECKPOINT_PATH)
-            print(f"         → Checkpoint saved to {CHECKPOINT_PATH}")
+                "env": env_name,
+            }, checkpoint_path)
+            print(f"         → Checkpoint saved to {checkpoint_path}")
 
-        # periodic plot update
         if update % PLOT_EVERY == 0:
-            save_plots(history, PLOT_DIR)
+            save_plots(history, PLOT_DIR, plot_filename, env_name)
             print(f"         → Plots updated in {PLOT_DIR}")
 
     # final save
@@ -293,13 +348,14 @@ def main():
         "vocab": vocab.word2idx,
         "update": update,
         "total_frames": total_frames,
-    }, CHECKPOINT_PATH)
+        "env": env_name,
+    }, checkpoint_path)
     csv_file.close()
-    save_plots(history, PLOT_DIR)
+    save_plots(history, PLOT_DIR, plot_filename, env_name)
     print(f"\n Training complete.")
-    print(f" Final checkpoint : {CHECKPOINT_PATH}")
-    print(f" Metrics CSV      : {CSV_PATH}")
-    print(f" Plots            : {PLOT_DIR}")
+    print(f" Final checkpoint : {checkpoint_path}")
+    print(f" Metrics CSV      : {csv_path}")
+    print(f" Plots            : {os.path.join(PLOT_DIR, plot_filename)}")
     print(f" Total updates: {update}, Total frames: {total_frames:,}")
 
 

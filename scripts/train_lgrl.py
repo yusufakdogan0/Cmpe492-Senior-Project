@@ -1,15 +1,25 @@
 """
-LGRL PPO training on MiniGrid-DoorKey-5x5-v0.
+LGRL PPO training on MiniGrid with stage-based forward-only hierarchy.
 
-Stage-based hierarchy with forward-only progression.
 Supports both LLM (Qwen 2.5 7B) and rule-based oracle planners.
+
+Supported environments:
+  - MiniGrid-DoorKey-5x5-v0              (5 stages)
+  - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0   (1 stage)
+  - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (1 stage)
 
 Subgoals follow the LGRL paper: search for, pickup, open, close, drop.
 No "explore" or "go to".
 
+Artifact naming:
+  - DoorKey-5x5 (legacy default) keeps base names: lgrl.pt, lgrl_metrics.csv
+  - Other envs are suffixed:  lgrl_gotodoor5x5.pt, etc.
+
 Usage:
-    python scripts/train_lgrl.py                       # LLM planner (default)
-    python scripts/train_lgrl.py --planner rule_based  # oracle ablation
+    python scripts/train_lgrl.py                                      # LLM planner, DoorKey
+    python scripts/train_lgrl.py --env MiniGrid-GoToDoor-5x5-v0
+    python scripts/train_lgrl.py --env MiniGrid-GoToObject-6x6-N2-v0
+    python scripts/train_lgrl.py --planner rule_based                 # oracle ablation
     python scripts/train_lgrl.py --resume
 """
 
@@ -40,39 +50,45 @@ torch_ac.algos.base.ParallelEnv = SequentialEnv
 from models.baseline_agent import Vocabulary
 from models.lgrl_agent import LGRLAgent
 from utils.env_parser import parse_env_description
+from utils.env_utils import (
+    SUPPORTED_ENVS,
+    LEGACY_DEFAULT_ENV,
+    env_max_steps,
+    resolve_artifact_stem,
+)
 from utils.llm_planner import LLMPlanner
 from utils.rule_based_planner import RuleBasedPlanner
 from utils.subgoal_tracker import SubgoalTracker
 from utils.subgoal_logger import SubgoalLogger
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Static configuration
 # ---------------------------------------------------------------------------
 
-ENV_NAME            = "MiniGrid-DoorKey-5x5-v0"
+DEFAULT_ENV = LEGACY_DEFAULT_ENV
 NUM_ENVS            = 16
 NUM_FRAMES_PER_PROC = 128
 TOTAL_FRAMES        = 10_000_000
 
+# PPO hyperparameters from LGRL paper (Section 4.3)
 LR              = 1e-4
 DISCOUNT        = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
+BATCH_SIZE      = 256
+# Not specified in the paper
 ENTROPY_COEF    = 0.01
 VALUE_LOSS_COEF = 0.5
 MAX_GRAD_NORM   = 0.5
 EPOCHS          = 4
-BATCH_SIZE      = 256
 RECURRENCE      = 4
 
-R_MISSION       = 0.5            # max mission reward 
-R_SUBGOAL       = 0.5            # max per-subgoal reward 
-MISSION_TIME_COEF = 0.5          # time penalty steepness for mission 
-SUBGOAL_TIME_COEF = 0.5          # time penalty steepness for subgoals 
-N_SUBGOALS      = RuleBasedPlanner.NUM_STAGES  # 5
-MAX_ENV_STEPS   = 250            # T_max for mission reward scaling
-MAX_SUBGOAL_STEPS = 250          # T_max for subgoal budget calculation
-SUBGOAL_TIMEOUT_MULT = 2.0       # subgoal times out when steps > mult * T_i
+# Reward scaffolding (paper Eqs. 5–7)
+R_MISSION            = 0.5
+R_SUBGOAL            = 0.5
+MISSION_TIME_COEF    = 0.5
+SUBGOAL_TIME_COEF    = 0.5
+SUBGOAL_TIMEOUT_MULT = 2.0
 
 CHECKPOINT_DIR  = os.path.join(PROJECT_ROOT, "checkpoints")
 CHECKPOINT_EVERY = 10
@@ -80,6 +96,8 @@ CHECKPOINT_EVERY = 10
 LOG_DIR    = os.path.join(PROJECT_ROOT, "logs")
 PLOT_DIR   = os.path.join(LOG_DIR, "plots")
 PLOT_EVERY = 50
+
+BASE_ARTIFACT_STEM = "lgrl"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -89,6 +107,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--env",
+        default=DEFAULT_ENV,
+        choices=SUPPORTED_ENVS,
+        help=f"MiniGrid environment id (default: {DEFAULT_ENV})",
+    )
     parser.add_argument("--planner", choices=["llm", "rule_based"], default="llm")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--subgoal-log", action="store_true", default=False)
@@ -99,10 +123,20 @@ def parse_args():
 # ---------------------------------------------------------------------------
 
 class HierarchyState:
-    def __init__(self, num_envs: int, planner, envs: list):
+    def __init__(
+        self,
+        num_envs: int,
+        planner,
+        envs: list,
+        *,
+        n_subgoals: int,
+        t_max: int,
+    ):
         self.num_envs = num_envs
         self.planner = planner
         self.envs = envs
+        self.n_subgoals = n_subgoals
+        self.t_max = t_max
         self._init_lists()
 
     def _init_lists(self):
@@ -133,14 +167,15 @@ class HierarchyState:
         self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        i = min(self.stage_indices[env_idx] + 1, N_SUBGOALS)
-        return (i / N_SUBGOALS) * MAX_SUBGOAL_STEPS
+        i = min(self.stage_indices[env_idx] + 1, self.n_subgoals)
+        return (i / self.n_subgoals) * self.t_max
 
     def advance(self, env_idx: int, obs: dict):
         next_stage = self.stage_indices[env_idx] + 1
-        if next_stage >= N_SUBGOALS:
-            self.stage_indices[env_idx] = N_SUBGOALS
-            self.active_subgoals[env_idx] = "search for the goal"
+        if next_stage >= self.n_subgoals:
+            # All stages done — keep the last active subgoal visible to
+            # the text stream; no more subgoal rewards.
+            self.stage_indices[env_idx] = self.n_subgoals
             self.step_counters[env_idx] = 0
             return
 
@@ -169,10 +204,10 @@ def make_preprocess_obss(vocab, hierarchy_state, device=None):
             subgoal = (
                 hierarchy_state.active_subgoals[i]
                 if i < hierarchy_state.num_envs
-                else "search for the goal"
+                else ""
             )
             if not subgoal:
-                subgoal = "search for the key"
+                subgoal = "search for the target"
             combined = f"{obs['mission']} [SEP] {subgoal}"
             token_ids.append(vocab.tokenize(combined, max_len=32))
 
@@ -204,7 +239,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
             success = reward > 0
             if success:
                 t_total = hierarchy_state.episode_steps[env_idx]
-                ratio = min(t_total / MAX_ENV_STEPS, 1.0)
+                ratio = min(t_total / hierarchy_state.t_max, 1.0)
                 total_reward += R_MISSION * (1.0 - MISSION_TIME_COEF * ratio)
             if logger:
                 logger.on_episode_end(
@@ -214,7 +249,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
             hierarchy_state.reset_env(env_idx)
             return total_reward
 
-        if hierarchy_state.stage_indices[env_idx] >= N_SUBGOALS:
+        if hierarchy_state.stage_indices[env_idx] >= hierarchy_state.n_subgoals:
             return total_reward
 
         if not hierarchy_state.active_subgoals[env_idx]:
@@ -243,7 +278,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
         if completed:
             ratio = min(t_used / max(t_budget, 1), SUBGOAL_TIMEOUT_MULT)
             r_i = max(R_SUBGOAL * (1.0 - SUBGOAL_TIME_COEF * ratio), 0.0)
-            total_reward += r_i / N_SUBGOALS
+            total_reward += r_i / hierarchy_state.n_subgoals
 
             hierarchy_state.histories[env_idx].append(
                 {"subgoal": subgoal, "status": "Success", "steps": t_used,
@@ -254,7 +289,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
                     env_idx, "completed", mission=mission, subgoal=subgoal,
                     stage=hierarchy_state.stage_indices[env_idx],
                     steps_used=t_used, budget=t_budget,
-                    reward=r_i / N_SUBGOALS,
+                    reward=r_i / hierarchy_state.n_subgoals,
                 )
             hierarchy_state.advance(env_idx, obs)
             if logger:
@@ -314,12 +349,15 @@ def _smooth(values, window=20):
     return out
 
 
-def save_plots(history, plot_dir, planner_tag):
+def save_plots(history, plot_dir, planner_tag, artifact_stem, env_name):
     frames = history["frames"]
     if len(frames) < 2:
         return
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
-    fig.suptitle(f"LGRL PPO ({planner_tag}) -- Training Curves", fontsize=14, fontweight="bold")
+    fig.suptitle(
+        f"LGRL PPO ({planner_tag}) -- {env_name}",
+        fontsize=14, fontweight="bold",
+    )
 
     ax = axes[0, 0]
     ax.plot(frames, history["avg_return"], alpha=0.3, color="tab:blue", linewidth=0.5)
@@ -345,17 +383,19 @@ def save_plots(history, plot_dir, planner_tag):
     ax.legend(); ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "lgrl_training_curves.png"), dpi=150)
+    plt.savefig(os.path.join(plot_dir, f"{artifact_stem}_training_curves.png"), dpi=150)
     plt.close(fig)
 
 
-def _save_checkpoint(path, model, algo, vocab, update, total_frames, planner_tag):
+def _save_checkpoint(path, model, algo, vocab, update, total_frames,
+                     planner_tag, env_name):
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": algo.optimizer.state_dict(),
         "vocab": vocab.word2idx,
         "update": update, "total_frames": total_frames,
         "planner": planner_tag,
+        "env": env_name,
     }, path)
 
 
@@ -377,27 +417,40 @@ def _load_history_from_csv(csv_path, csv_fields):
 def main():
     args = parse_args()
     planner_tag = args.planner
+    env_name = args.env
 
-    csv_path = os.path.join(LOG_DIR, "lgrl_metrics.csv")
-    checkpoint_path = os.path.join(CHECKPOINT_DIR, "lgrl.pt")
+    t_max = env_max_steps(env_name)
+    artifact_stem = resolve_artifact_stem(BASE_ARTIFACT_STEM, env_name)
 
-    print("=" * 60)
-    print("  LGRL PPO Training (stage-based) -- MiniGrid-DoorKey-5x5-v0")
-    print("=" * 60)
+    sample_env = gym.make(env_name)
+    sample_obs, _ = sample_env.reset()
+    sample_env.close()
+    n_subgoals = RuleBasedPlanner.num_stages(sample_obs["mission"])
+
+    csv_path = os.path.join(LOG_DIR, f"{artifact_stem}_metrics.csv")
+    checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{artifact_stem}.pt")
+
+    print("=" * 70)
+    print("  LGRL PPO Training (stage-based)")
+    print("=" * 70)
+    print(f"  Env            : {env_name}")
+    print(f"  Artifact stem  : {artifact_stem}")
     print(f"  Device         : {DEVICE}")
     print(f"  Envs           : {NUM_ENVS} parallel")
     print(f"  Frames         : {TOTAL_FRAMES:,}")
     print(f"  Planner        : {planner_tag}")
-    print(f"  Stages         : {N_SUBGOALS}")
+    print(f"  Stages         : {n_subgoals}")
+    print(f"  T_max          : {t_max}  (from env.unwrapped.max_steps)")
     print(f"  R_mission      : {R_MISSION}")
     print(f"  R_subgoal      : {R_SUBGOAL}")
-    print("=" * 60)
+    print("=" * 70)
 
-    envs = [make_env(ENV_NAME, seed=i) for i in range(NUM_ENVS)]
+    envs = [make_env(env_name, seed=i) for i in range(NUM_ENVS)]
 
     vocab = Vocabulary()
-    sample_obs, _ = gym.make(ENV_NAME).reset()
-    vocab.tokenize(f"{sample_obs['mission']} [SEP] search for the yellow key", max_len=32)
+    vocab.tokenize(
+        f"{sample_obs['mission']} [SEP] search for the target", max_len=32
+    )
 
     obs_space = envs[0].observation_space
     act_space = envs[0].action_space
@@ -406,17 +459,20 @@ def main():
 
     print(f"  Action space   : {act_space.n} actions")
     print(f"  Model params   : {sum(p.numel() for p in model.parameters()):,}")
-    print("=" * 60)
+    print("=" * 70)
 
     if planner_tag == "llm":
         planner = LLMPlanner()
     else:
         planner = RuleBasedPlanner()
 
-    hierarchy_state = HierarchyState(NUM_ENVS, planner, envs)
+    hierarchy_state = HierarchyState(
+        NUM_ENVS, planner, envs,
+        n_subgoals=n_subgoals, t_max=t_max,
+    )
 
     logger = (
-        SubgoalLogger(LOG_DIR, "lgrl", NUM_ENVS)
+        SubgoalLogger(LOG_DIR, artifact_stem, NUM_ENVS)
         if args.subgoal_log else None
     )
 
@@ -449,6 +505,11 @@ def main():
 
     if args.resume and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
+        saved_env = ckpt.get("env")
+        if saved_env is not None and saved_env != env_name:
+            raise SystemExit(
+                f"Checkpoint env mismatch: expected {env_name!r}, got {saved_env!r}."
+            )
         model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             algo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -506,16 +567,16 @@ def main():
 
         if update % CHECKPOINT_EVERY == 0:
             _save_checkpoint(checkpoint_path, model, algo, vocab,
-                             update, total_frames, planner_tag)
+                             update, total_frames, planner_tag, env_name)
         if update % PLOT_EVERY == 0:
-            save_plots(history, PLOT_DIR, planner_tag)
+            save_plots(history, PLOT_DIR, planner_tag, artifact_stem, env_name)
 
     _save_checkpoint(checkpoint_path, model, algo, vocab,
-                     update, total_frames, planner_tag)
+                     update, total_frames, planner_tag, env_name)
     csv_file.close()
     if logger is not None:
         logger.close()
-    save_plots(history, PLOT_DIR, planner_tag)
+    save_plots(history, PLOT_DIR, planner_tag, artifact_stem, env_name)
 
     print(f"\nTraining complete.")
     print(f"  Checkpoint : {checkpoint_path}")

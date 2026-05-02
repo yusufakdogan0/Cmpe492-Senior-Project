@@ -7,18 +7,20 @@ Supported environments:
   - MiniGrid-DoorKey-5x5-v0              (5 stages)
   - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0   (1 stage)
   - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (1 stage)
+  - MiniGrid-UnlockPickup-v0             (6 stages)
 
 Subgoals follow the LGRL paper: search for, pickup, open, close, drop.
 No "explore" or "go to".
 
 Artifact naming:
   - DoorKey-5x5 (legacy default) keeps base names: lgrl.pt, lgrl_metrics.csv
-  - Other envs are suffixed:  lgrl_gotodoor5x5.pt, etc.
+  - Other envs are suffixed:  lgrl_gotodoor5x5.pt, lgrl_unlockpickup.pt, etc.
 
 Usage:
     python scripts/train_lgrl.py                                      # LLM planner, DoorKey
     python scripts/train_lgrl.py --env MiniGrid-GoToDoor-5x5-v0
     python scripts/train_lgrl.py --env MiniGrid-GoToObject-6x6-N2-v0
+    python scripts/train_lgrl.py --env MiniGrid-UnlockPickup-v0
     python scripts/train_lgrl.py --planner rule_based                 # oracle ablation
     python scripts/train_lgrl.py --resume
 """

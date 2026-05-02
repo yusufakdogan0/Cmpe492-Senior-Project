@@ -8,10 +8,11 @@ Supported environments:
   - MiniGrid-DoorKey-5x5-v0              (legacy default)
   - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0
   - MiniGrid-GoToObject-{6x6,8x8}-N2-v0
+  - MiniGrid-UnlockPickup-v0
 
 Artifact naming:
   - DoorKey-5x5 keeps base names:  baseline.pt, baseline_metrics.csv, training_curves.png
-  - Other envs are suffixed:       baseline_gotodoor5x5.pt, baseline_gotodoor5x5_metrics.csv, etc.
+  - Other envs are suffixed:       baseline_gotodoor5x5.pt, baseline_unlockpickup.pt, etc.
 
 Hyperparams:
     lr=1e-4, gamma=0.99, gae_lambda=0.95, clip=0.2, batch_size=256
@@ -20,6 +21,7 @@ Usage:
     python scripts/train_baseline.py
     python scripts/train_baseline.py --env MiniGrid-GoToDoor-5x5-v0
     python scripts/train_baseline.py --env MiniGrid-GoToObject-6x6-N2-v0
+    python scripts/train_baseline.py --env MiniGrid-UnlockPickup-v0
 """
 
 import argparse

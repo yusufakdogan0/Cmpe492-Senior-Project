@@ -21,6 +21,18 @@ Supported environments:
     Stage 0 — search for the [color] [object]
               where [object] is one of {key, ball, box}
 
+  UnlockPickup-* (6 stages)
+    Stage 0 — search for the [key_color] key       (skipped if visible/carried)
+    Stage 1 — pickup the [key_color] key           (skipped if already carried)
+    Stage 2 — search for the [door_color] door     (skipped if door visible)
+    Stage 3 — open the locked [door_color] door    (skipped if door open)
+    Stage 4 — search for the [target_color] [obj]  (skipped if target visible)
+    Stage 5 — pickup the [target_color] [obj]
+
+    Note: the key/door color is inferred from the observation (it is NOT in
+    the mission text). The target color and object type come from the
+    mission "pick up the [color] [object]". The two colors typically differ.
+
 In all cases the stage index only advances forward, preventing the agent
 from farming rewards by repeating earlier subgoals.
 """
@@ -35,6 +47,7 @@ KNOWN_OBJECTS = {"key", "ball", "box", "door", "goal"}
 # Per-mission-family stage counts (paper Eq. 6 n)
 DOORKEY_STAGES = 5
 GOTO_STAGES = 1
+UNLOCKPICKUP_STAGES = 6
 
 
 class RuleBasedPlanner:
@@ -62,7 +75,7 @@ class RuleBasedPlanner:
 
     @staticmethod
     def classify_mission(mission: str) -> str:
-        """Return one of 'doorkey' | 'gotodoor' | 'gotoobject'.
+        """Return one of 'doorkey' | 'gotodoor' | 'gotoobject' | 'unlockpickup'.
 
         Detection is purely from the mission string, not the environment
         name, so custom envs with the same mission template work too.
@@ -77,6 +90,11 @@ class RuleBasedPlanner:
         if m.startswith("go to the") and any(t in m for t in ("key", "ball", "box")):
             return "gotoobject"
 
+        # UnlockPickup format: "pick up the <color> <box|ball|key>"
+        # Also accept "pickup the ..." for robustness.
+        if m.startswith("pick up the") or m.startswith("pickup the"):
+            return "unlockpickup"
+
         # Default: DoorKey ("use the key to open the door and then get to the goal")
         return "doorkey"
 
@@ -86,6 +104,8 @@ class RuleBasedPlanner:
         family = cls.classify_mission(mission)
         if family in ("gotodoor", "gotoobject"):
             return GOTO_STAGES
+        if family == "unlockpickup":
+            return UNLOCKPICKUP_STAGES
         return DOORKEY_STAGES
 
     # -- main entry point ----------------------------------------------
@@ -114,6 +134,10 @@ class RuleBasedPlanner:
         elif family == "gotoobject":
             subgoal, new_stage = self._gotoobject_stages(
                 stage_index, mission, entities
+            )
+        elif family == "unlockpickup":
+            subgoal, new_stage = self._unlockpickup_stages(
+                stage_index, mission, inventory, entities
             )
         else:
             subgoal, new_stage = self._doorkey_stages(
@@ -255,6 +279,150 @@ class RuleBasedPlanner:
         # Past the only stage — keep the same subgoal visible
         return label, GOTO_STAGES
 
+    # -- UnlockPickup stage machine ------------------------------------
+
+    def _unlockpickup_stages(
+        self, stage: int, mission: str, inventory: str, entities: list[dict]
+    ) -> tuple[str, int]:
+        """Six-stage planner for UnlockPickup.
+
+        Mission: "pick up the <target_color> <target_object>"
+        (target_object is typically "box" in MiniGrid-UnlockPickup-v0).
+
+        Stages:
+          0 — search for the <key_color> key      (skip if key visible/carried)
+          1 — pickup the <key_color> key          (skip if already carried)
+          2 — search for the <door_color> door    (skip if door visible)
+          3 — open the locked <door_color> door   (skip if door already open)
+          4 — search for the <target_color> <target_object>
+                                                  (skip if target visible/carried)
+          5 — pickup the <target_color> <target_object>
+
+        Color handling: the key/door color is inferred from the observation
+        (a visible key, or a visible door) — it is NOT in the mission text.
+        The target color and object type come from the mission. The two
+        colors typically differ (e.g. yellow key + purple box).
+
+        Forward-only invariant: returned stage >= input stage.
+        """
+        inv_words = inventory.lower().split()
+        carrying_key = "key" in inv_words
+
+        # Mission-derived target details
+        target_color = _mission_color(mission)
+        target_type = _mission_object(mission)
+
+        # Are we already carrying the target object?
+        carrying_target = (
+            target_type
+            and target_type in inv_words
+            and (not target_color or target_color in inv_words)
+        )
+
+        keys = _find_entities(entities, obj_type="key")
+        locked_doors = _find_entities(entities, obj_type="door", status="locked")
+        open_doors = _find_entities(entities, obj_type="door", status="open")
+        all_doors = _find_entities(entities, obj_type="door")
+
+        # Has the target object come into view?
+        target_visible = bool(_find_entities(
+            entities, obj_type=target_type, color=target_color or None
+        )) if target_type else False
+
+        # Infer the key color (key matches door in UnlockPickup).
+        # If a key is visible we use that; else if a door is visible
+        # we copy its color; else if we're carrying the key, parse the
+        # inventory string.
+        key_color = ""
+        if keys:
+            key_color = _entity_color(keys[0])
+        elif all_doors:
+            key_color = _entity_color(all_doors[0])
+        elif carrying_key:
+            key_color = _extract_color(inv_words)
+
+        # Door color usually equals key color; prefer an actually-visible
+        # door's color when available.
+        door_color = key_color
+        if all_doors:
+            door_color = _entity_color(all_doors[0])
+
+        # --- Stage 0: search for the key ---
+        if stage <= 0:
+            if carrying_key:
+                return self._unlockpickup_stages(2, mission, inventory, entities)
+            if keys:
+                return self._unlockpickup_stages(1, mission, inventory, entities)
+            color = key_color or door_color
+            label = f"search for the {color} key" if color else "search for the key"
+            return label, 0
+
+        # --- Stage 1: pickup the key ---
+        if stage <= 1:
+            if carrying_key:
+                return self._unlockpickup_stages(2, mission, inventory, entities)
+            color = key_color or door_color
+            label = f"pickup the {color} key" if color else "pickup the key"
+            return label, 1
+
+        # --- Stage 2: search for the door ---
+        if stage <= 2:
+            if locked_doors:
+                return self._unlockpickup_stages(3, mission, inventory, entities)
+            if open_doors:
+                # Door already open (e.g. opened earlier this episode) —
+                # skip past Stage 3.
+                return self._unlockpickup_stages(4, mission, inventory, entities)
+            color = door_color or key_color
+            label = (
+                f"search for the {color} door" if color else "search for the door"
+            )
+            return label, 2
+
+        # --- Stage 3: open the locked door ---
+        if stage <= 3:
+            if open_doors:
+                return self._unlockpickup_stages(4, mission, inventory, entities)
+            color = door_color or key_color
+            label = (
+                f"open the locked {color} door"
+                if color else "open the locked door"
+            )
+            return label, 3
+
+        # --- Stage 4: search for the target object ---
+        if stage <= 4:
+            if carrying_target or target_visible:
+                return self._unlockpickup_stages(5, mission, inventory, entities)
+            if target_color and target_type:
+                label = f"search for the {target_color} {target_type}"
+            elif target_type:
+                label = f"search for the {target_type}"
+            else:
+                label = "search for the target"
+            return label, 4
+
+        # --- Stage 5: pickup the target object ---
+        if stage <= 5:
+            if target_color and target_type:
+                label = f"pickup the {target_color} {target_type}"
+            elif target_type:
+                label = f"pickup the {target_type}"
+            else:
+                label = "pickup the target"
+            return label, 5
+
+        # All stages exhausted — keep the final subgoal visible to the
+        # agent's text stream while the training loop's
+        # stage_index >= n_subgoals check prevents further reward.
+        if target_color and target_type:
+            label = f"pickup the {target_color} {target_type}"
+        elif target_type:
+            label = f"pickup the {target_type}"
+        else:
+            label = "pickup the target"
+        return label, UNLOCKPICKUP_STAGES
+
 
 # -- helper functions (module-level) -----------------------------------
 
@@ -300,7 +468,7 @@ def _mission_color(mission: str) -> str:
 
 
 def _mission_object(mission: str) -> str:
-    """Extract object type from a 'go to the ...' mission string.
+    """Extract object type from a mission string.
 
     Returns one of {'key', 'ball', 'box', 'door'} or '' if none found.
     """
@@ -326,6 +494,7 @@ if __name__ == "__main__":
         ("MiniGrid-DoorKey-5x5-v0", 5),
         ("MiniGrid-GoToDoor-5x5-v0", 1),
         ("MiniGrid-GoToObject-6x6-N2-v0", 1),
+        ("MiniGrid-UnlockPickup-v0", 6),
     ]
 
     print("=" * 70)
@@ -353,7 +522,7 @@ if __name__ == "__main__":
                 mission, env_json, obs["direction"], stage_index=0
             )
             print(
-                f"  seed={seed} family={family:<10} "
+                f"  seed={seed} family={family:<13} "
                 f"mission={mission!r} -> stage={new_stage} '{subgoal}'"
             )
 

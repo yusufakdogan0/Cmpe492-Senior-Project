@@ -25,6 +25,7 @@ SUPPORTED_ENVS: tuple[str, ...] = (
     "MiniGrid-GoToDoor-8x8-v0",
     "MiniGrid-GoToObject-6x6-N2-v0",
     "MiniGrid-GoToObject-8x8-N2-v0",
+    "MiniGrid-UnlockPickup-v0",
 )
 
 # DoorKey-5x5 keeps legacy artifact names ("baseline.pt", "lgrl.pt",
@@ -40,6 +41,7 @@ def env_stem(env_name: str) -> str:
         MiniGrid-DoorKey-5x5-v0          -> doorkey5x5
         MiniGrid-GoToDoor-5x5-v0         -> gotodoor5x5
         MiniGrid-GoToObject-6x6-N2-v0    -> gotoobject6x6n2
+        MiniGrid-UnlockPickup-v0         -> unlockpickup
     """
     name = env_name
     if name.startswith("MiniGrid-"):

@@ -159,7 +159,10 @@ class HierarchyState:
       - ``family_per_env[i]``      — mission family label
 
     Per-episode tracking drained by the training loop each update:
-      - ``completed_episodes`` — list[(family, return, steps, success)].
+      - ``episode_raw_return[i]`` — accumulated RAW env reward this episode
+                                     (matches torch_ac's `return_per_episode`,
+                                      not the shaped reward).
+      - ``completed_episodes`` — list[(family, raw_return, steps, success)].
     """
 
     def __init__(
@@ -188,7 +191,7 @@ class HierarchyState:
         self.stage_indices: list[int] = [0] * self.num_envs
         self.step_counters: list[int] = [0] * self.num_envs
         self.episode_steps: list[int] = [0] * self.num_envs
-        self.episode_return_so_far: list[float] = [0.0] * self.num_envs
+        self.episode_raw_return: list[float] = [0.0] * self.num_envs
         self.trackers: list[SubgoalTracker] = [
             SubgoalTracker() for _ in range(self.num_envs)
         ]
@@ -209,7 +212,7 @@ class HierarchyState:
         self.stage_indices[env_idx] = 0
         self.step_counters[env_idx] = 0
         self.episode_steps[env_idx] = 0
-        self.episode_return_so_far[env_idx] = 0.0
+        self.episode_raw_return[env_idx] = 0.0
         self.trackers[env_idx].reset()
         self.histories[env_idx] = []
 
@@ -292,6 +295,10 @@ def make_reshape_reward(hierarchy_state, logger=None):
         total_reward = 0.0
         hierarchy_state.step_counters[env_idx] += 1
         hierarchy_state.episode_steps[env_idx] += 1
+        # Accumulate RAW env reward — matches torch_ac's `return_per_episode`
+        # semantics so per-family `<fam>_avg_return` is comparable to the
+        # global `avg_return`. Subgoal/mission shaping is NOT included here.
+        hierarchy_state.episode_raw_return[env_idx] += float(reward)
         mission = obs.get("mission", "")
 
         n_subgoals = hierarchy_state.n_subgoals(env_idx)
@@ -308,10 +315,12 @@ def make_reshape_reward(hierarchy_state, logger=None):
                     env_idx, mission, success,
                     hierarchy_state.episode_steps[env_idx],
                 )
-            ep_return = hierarchy_state.episode_return_so_far[env_idx] + total_reward
+            # Push completed-episode record for per-family aggregation.
+            # The return value is the RAW env reward (matches the global
+            # `avg_return` torch_ac reports), not the shaped reward.
             hierarchy_state.completed_episodes.append((
                 hierarchy_state.family_per_env[env_idx],
-                ep_return,
+                hierarchy_state.episode_raw_return[env_idx],
                 hierarchy_state.episode_steps[env_idx],
                 success,
             ))
@@ -319,7 +328,6 @@ def make_reshape_reward(hierarchy_state, logger=None):
             return total_reward
 
         if hierarchy_state.stage_indices[env_idx] >= n_subgoals:
-            hierarchy_state.episode_return_so_far[env_idx] += total_reward
             return total_reward
 
         if not hierarchy_state.active_subgoals[env_idx]:
@@ -400,7 +408,6 @@ def make_reshape_reward(hierarchy_state, logger=None):
                     raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
                 )
 
-        hierarchy_state.episode_return_so_far[env_idx] += total_reward
         return total_reward
 
     reshape_reward._current_env_idx = 0

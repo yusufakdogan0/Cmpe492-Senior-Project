@@ -14,11 +14,13 @@ Supported environments:
     Stage 3 — open the locked [color] door
     Stage 4 — search for the goal
 
-  GoToDoor-*  (1 stage)
-    Stage 0 — search for the [color] door
+  GoToDoor-*  (2 stages)
+    Stage 0 — search for the [color] door  (object enters FOV)
+    Stage 1 — go near the [color] door     (agent adjacent to target)
 
-  GoToObject-*  (1 stage)
-    Stage 0 — search for the [color] [object]
+  GoToObject-*  (2 stages)
+    Stage 0 — search for the [color] [object]  (object enters FOV)
+    Stage 1 — go near the [color] [object]     (agent adjacent to target)
               where [object] is one of {key, ball, box}
 
 In all cases the stage index only advances forward, preventing the agent
@@ -34,7 +36,7 @@ KNOWN_OBJECTS = {"key", "ball", "box", "door", "goal"}
 
 # Per-mission-family stage counts (paper Eq. 6 n)
 DOORKEY_STAGES = 5
-GOTO_STAGES = 1
+GOTO_STAGES = 2
 
 
 class RuleBasedPlanner:
@@ -202,58 +204,76 @@ class RuleBasedPlanner:
     def _gotodoor_stages(
         self, stage: int, mission: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Single-stage planner for GoToDoor.
+        """Two-stage planner for GoToDoor.
 
         Mission: "go to the <color> door"
-        Subgoal: "search for the <color> door"
+        Stage 0 — search for the <color> door  (door enters FOV)
+        Stage 1 — go near the <color> door     (agent adjacent)
 
         The mission is solved by executing `done` next to the target door;
         the mission-level reward (Eq. 5) handles that terminal action.
-        The single subgoal rewards the agent for bringing the door into
-        its field of view.
         """
         color = _mission_color(mission)
-        label = (
+        search_label = (
             f"search for the {color} door" if color else "search for the door"
         )
+        near_label = (
+            f"go near the {color} door" if color else "go near the door"
+        )
 
+        # --- Stage 0: search for door ---
         if stage <= 0:
-            return label, 0
+            # Skip if target door is already visible
+            target_doors = _find_entities(entities, obj_type="door", color=color)
+            if target_doors:
+                return self._gotodoor_stages(1, mission, entities)
+            return search_label, 0
 
-        # Past the only stage — keep the same subgoal visible to the agent's
-        # text stream. The training loop's stage_index >= n_subgoals check
-        # prevents further subgoal completion rewards.
-        return label, GOTO_STAGES
+        # --- Stage 1: go near door ---
+        if stage <= 1:
+            return near_label, 1
+
+        # All stages exhausted — keep the near subgoal visible
+        return near_label, GOTO_STAGES
 
     # -- GoToObject stage machine --------------------------------------
 
     def _gotoobject_stages(
         self, stage: int, mission: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Single-stage planner for GoToObject.
+        """Two-stage planner for GoToObject.
 
         Mission: "go to the <color> <key|ball|box>"
-        Subgoal: "search for the <color> <key|ball|box>"
-
-        The object type is parsed from the mission string so the subgoal
-        tracker can verify the specific target, not just any object of
-        matching color.
+        Stage 0 — search for the <color> <object>  (object enters FOV)
+        Stage 1 — go near the <color> <object>     (agent adjacent)
         """
         color = _mission_color(mission)
         obj_type = _mission_object(mission)
 
         if color and obj_type:
-            label = f"search for the {color} {obj_type}"
+            search_label = f"search for the {color} {obj_type}"
+            near_label = f"go near the {color} {obj_type}"
         elif obj_type:
-            label = f"search for the {obj_type}"
+            search_label = f"search for the {obj_type}"
+            near_label = f"go near the {obj_type}"
         else:
-            label = "search for the object"
+            search_label = "search for the object"
+            near_label = "go near the object"
 
+        # --- Stage 0: search for object ---
         if stage <= 0:
-            return label, 0
+            # Skip if target is already visible
+            target = _find_entities(entities, obj_type=obj_type, color=color)
+            if target:
+                return self._gotoobject_stages(1, mission, entities)
+            return search_label, 0
 
-        # Past the only stage — keep the same subgoal visible
-        return label, GOTO_STAGES
+        # --- Stage 1: go near object ---
+        if stage <= 1:
+            return near_label, 1
+
+        # All stages exhausted — keep the near subgoal visible
+        return near_label, GOTO_STAGES
 
 
 # -- helper functions (module-level) -----------------------------------
@@ -324,8 +344,8 @@ if __name__ == "__main__":
 
     test_envs = [
         ("MiniGrid-DoorKey-5x5-v0", 5),
-        ("MiniGrid-GoToDoor-5x5-v0", 1),
-        ("MiniGrid-GoToObject-6x6-N2-v0", 1),
+        ("MiniGrid-GoToDoor-5x5-v0", 2),
+        ("MiniGrid-GoToObject-6x6-N2-v0", 2),
     ]
 
     print("=" * 70)

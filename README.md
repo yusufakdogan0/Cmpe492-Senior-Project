@@ -59,11 +59,11 @@ All three training scripts accept `--env <env_id>`. Supported environments mirro
 | Env ID                              | Mission template                                        | Stages | `T_max` (from `env.max_steps`) |
 |-------------------------------------|---------------------------------------------------------|:------:|:------------------------------:|
 | `MiniGrid-DoorKey-5x5-v0` (default) | `use the key to open the door and then get to the goal` | 5      | 250                            |
-| `MiniGrid-GoToDoor-5x5-v0`          | `go to the <color> door`                                | 1      | 100                            |
-| `MiniGrid-GoToDoor-6x6-v0`          | `go to the <color> door`                                | 1      | 144                            |
-| `MiniGrid-GoToDoor-8x8-v0`          | `go to the <color> door`                                | 1      | 256                            |
-| `MiniGrid-GoToObject-6x6-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 1      | 180                            |
-| `MiniGrid-GoToObject-8x8-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 1      | 320                            |
+| `MiniGrid-GoToDoor-5x5-v0`          | `go to the <color> door`                                | 2      | 100                            |
+| `MiniGrid-GoToDoor-6x6-v0`          | `go to the <color> door`                                | 2      | 144                            |
+| `MiniGrid-GoToDoor-8x8-v0`          | `go to the <color> door`                                | 2      | 256                            |
+| `MiniGrid-GoToObject-6x6-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 2      | 180                            |
+| `MiniGrid-GoToObject-8x8-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 2      | 320                            |
 
 The `GoToDoor` and `GoToObject` families end when the agent issues the `done` action (MiniGrid action 6) while adjacent to the correct target; reaching that state gives the positive environment reward that triggers our mission-level reward (Eq. 5).
 
@@ -169,6 +169,7 @@ Only these subgoal forms are used:
 | Subgoal | Format                             | Example                    |
 |---------|------------------------------------|----------------------------|
 | Search  | `search for the [color] [object]`  | `search for the blue door` |
+| Go near | `go near the [color] [object]`     | `go near the blue key`     |
 | Pickup  | `pickup the [color] [object]`      | `pickup the yellow key`    |
 | Open    | `open the [status] [color] door`   | `open the locked yellow door` |
 | Close   | `close the [status] [color] door`  | `close the open yellow door` |
@@ -188,19 +189,21 @@ The rule-based planner dispatches on the mission string. The forward-only stage 
 | 3     | `open the locked [color] door` | Door already open → jump to stage 4         |
 | 4     | `search for the goal`          | —                                           |
 
-#### GoToDoor (1 stage)
+#### GoToDoor (2 stages)
 
-| Stage | Subgoal                        |
-|:-----:|--------------------------------|
-| 0     | `search for the [color] door`  |
+| Stage | Subgoal                        | Skipped if…                                 |
+|:-----:|--------------------------------|---------------------------------------------|
+| 0     | `search for the [color] door`  | Door already visible → jump to stage 1      |
+| 1     | `go near the [color] door`     | —                                           |
 
 The mission-completion reward (Eq. 5) is granted when the agent issues `done` next to the correct door.
 
-#### GoToObject (1 stage)
+#### GoToObject (2 stages)
 
-| Stage | Subgoal                                    |
-|:-----:|--------------------------------------------|
-| 0     | `search for the [color] [key\|ball\|box]`  |
+| Stage | Subgoal                                    | Skipped if…                                    |
+|:-----:|--------------------------------------------|------------------------------------------------|
+| 0     | `search for the [color] [key\|ball\|box]`  | Object already visible → jump to stage 1       |
+| 1     | `go near the [color] [key\|ball\|box]`     | —                                              |
 
 Same pattern as GoToDoor — the mission terminates on `done` next to the correct object.
 
@@ -228,7 +231,7 @@ All reward-shaping parameters are defined at the top of `train_lgrl.py` and `tra
 | `SUBGOAL_TIME_COEF`    | `0.5`               | 0.5 factor in Eq. 6                                             | Same shape as mission penalty                                         |
 | `T_max`                | `env.max_steps`     | Paper's `T_max`, derived from the env at startup                | Per-env: 250 / 100 / 144 / 256 / 180 / 320 (see table)                |
 | `SUBGOAL_TIMEOUT_MULT` | `2.0`               | Subgoal times out when `T_used > mult * T_i`                    | Also caps the ratio in the subgoal reward formula                     |
-| `N_SUBGOALS`           | derived from env    | Number of stages for this env family (5 / 1 / 1)                | Queried from `RuleBasedPlanner.num_stages(mission)` at startup         |
+| `N_SUBGOALS`           | derived from env    | Number of stages for this env family (5 / 2 / 2)                | Queried from `RuleBasedPlanner.num_stages(mission)` at startup         |
 
 ### PPO Hyperparameters (LGRL paper Section 4.3)
 

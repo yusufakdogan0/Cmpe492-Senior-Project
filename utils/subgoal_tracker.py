@@ -1,8 +1,9 @@
 """
 Subgoal completion verification for MiniGrid environments.
 
-Supports only the subgoal types from the LGRL paper:
+Supports the subgoal types from the LGRL paper plus "go near":
   - search for the [color] [object]
+  - go near the [color] [object]      (agent adjacent to target)
   - pickup the [color] [object]
   - open the [status] [color] door
   - close the [status] [color] door
@@ -29,7 +30,7 @@ class SubgoalTracker:
     been satisfied.
     """
 
-    RECOGNIZED_PREFIXES = ("pickup", "open", "close", "drop", "search for")
+    RECOGNIZED_PREFIXES = ("pickup", "open", "close", "drop", "search for", "go near")
 
     def reset(self):
         pass
@@ -52,6 +53,8 @@ class SubgoalTracker:
             return self._check_close(subgoal, env, action)
         if subgoal.startswith("drop"):
             return self._check_drop(subgoal, env)
+        if subgoal.startswith("go near"):
+            return self._check_go_near(subgoal, env)
         if subgoal.startswith("search for"):
             return self._check_search(subgoal, env, obs_image=obs_image)
         return False
@@ -90,6 +93,22 @@ class SubgoalTracker:
         if env.carrying.color == color and env.carrying.type == obj_type:
             return False
         return True
+
+    def _check_go_near(self, subgoal, env):
+        """'go near the [color] [object]' succeeds when the agent is
+        cardinally adjacent to a matching object on the grid."""
+        tc, tt = _extract_color_and_type(subgoal)
+        ax, ay = env.agent_pos
+        for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            cell = env.grid.get(ax + dx, ay + dy)
+            if cell is None:
+                continue
+            if tt and cell.type != tt:
+                continue
+            if tc and cell.color != tc:
+                continue
+            return True
+        return False
 
     def _check_search(self, subgoal, env, *, obs_image=None):
         """'search for the [color] [object]' succeeds when the specific
@@ -137,12 +156,13 @@ if __name__ == "__main__":
     import minigrid
 
     tracker = SubgoalTracker()
+
+    print("=" * 60)
+    print("  SubgoalTracker — Self-Test")
+    print("=" * 60)
+
+    # -- DoorKey tests ---------------------------------------------------
     env = gym.make("MiniGrid-DoorKey-5x5-v0")
-
-    print("=" * 60)
-    print("  SubgoalTracker — Self-Test (Paper Subgoals Only)")
-    print("=" * 60)
-
     obs, _ = env.reset(seed=0)
     uw = env.unwrapped
 
@@ -160,18 +180,53 @@ if __name__ == "__main__":
 
     result = tracker.check_completion("open the locked yellow door", uw, action=5)
     print(f"'open the locked yellow door' (toggle, no door ahead): {result}")
+    env.close()
 
-    # Verify "explore" is NOT recognized
+    # -- go near tests (GoToObject) --------------------------------------
+    print("\n--- go near tests (GoToObject-6x6) ---")
+    env2 = gym.make("MiniGrid-GoToObject-6x6-N2-v0")
+    for seed in range(20):
+        obs2, _ = env2.reset(seed=seed)
+        uw2 = env2.unwrapped
+        mission = obs2["mission"]
+        # Parse target from mission
+        words = mission.lower().split()
+        tc = tt = ""
+        for w in words:
+            if w in KNOWN_COLORS: tc = w
+            if w in KNOWN_TYPES: tt = w
+        subgoal = f"go near the {tc} {tt}"
+        # Step randomly (non-terminal) until adjacent or 50 steps
+        adjacent = tracker.check_completion(subgoal, uw2, action=0)
+        if adjacent:
+            print(f"  seed={seed}: already adjacent at reset — {subgoal} = True")
+        else:
+            for step in range(50):
+                import numpy as np
+                action = np.random.choice([0, 1, 2])  # left/right/forward
+                obs2, r, done, trunc, _ = env2.step(action)
+                if done or trunc:
+                    break
+                if tracker.check_completion(subgoal, uw2, action=action):
+                    print(f"  seed={seed}: adjacent after {step+1} steps — {subgoal} = True")
+                    break
+    env2.close()
+
+    # -- Prefix recognition tests ----------------------------------------
+    print("\n--- Prefix recognition ---")
     assert not SubgoalTracker.is_recognized("explore"), "explore should not be recognized"
-    # Verify "go to" is NOT recognized
     assert not SubgoalTracker.is_recognized("go to the yellow key"), "go to should not be recognized"
-    # Verify paper subgoals ARE recognized
     assert SubgoalTracker.is_recognized("search for the yellow key")
     assert SubgoalTracker.is_recognized("pickup the yellow key")
     assert SubgoalTracker.is_recognized("open the locked yellow door")
+    assert SubgoalTracker.is_recognized("go near the blue key")
+    assert SubgoalTracker.is_recognized("go near the green door")
+    print("  All prefix checks passed.")
 
     c, t = _extract_color_and_type("open the locked purple door")
     print(f"\nParsing 'open the locked purple door': color={c}, type={t}")
+    c, t = _extract_color_and_type("go near the blue key")
+    print(f"Parsing 'go near the blue key': color={c}, type={t}")
 
     print("\n" + "=" * 60)
     print("  All assertions passed.")

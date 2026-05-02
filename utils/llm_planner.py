@@ -2,7 +2,7 @@
 Subgoal generation via a local LLM (Ollama + Qwen 2.5 7B).
 
 Produces only subgoals from the LGRL paper:
-  search for, pickup, open, close, drop.
+  search for, go near, pickup, open, close, drop.
 No "explore" or "go to" subgoals.
 
 Falls back to "search for the key" on errors or parse failures.
@@ -23,6 +23,7 @@ You receive a JSON observation of your egocentric view and must generate the nex
 ## Allowed Subgoals
 Your output must be one of these action forms:
 - Subgoal: search for the [status?] [color] [object/door]<end>
+- Subgoal: go near the [color] [object/door]<end>
 - Subgoal: pickup the [color] [object]<end>
 - Subgoal: drop the [color] [object]<end>
 - Subgoal: open the [status] [color] door<end>
@@ -34,7 +35,7 @@ Your output must be one of these action forms:
 3. If no actionable entities are visible, use "search for" to find the next needed object.
 4. Output strictly in this format: Subgoal: <action><end>
 5. [status?] means status is optional (keys, balls have no state). [status] means required (doors are always open, closed, or locked).
-6. Never output "explore" or "go to" — use "search for" instead.
+6. Use "search for" to find things, "go near" to approach them.
 
 --- Example 1: Empty View & No Past Subgoals ---
 Mission: open the purple door
@@ -62,7 +63,7 @@ IDX_TO_DIRECTION = {0: "east", 1: "south", 2: "west", 3: "north"}
 SUBGOAL_PATTERN = re.compile(r"Subgoal:\s*(.*?)<end>", re.IGNORECASE | re.DOTALL)
 
 # Valid prefixes from the paper
-VALID_PREFIXES = ("search for", "pickup", "open", "close", "drop")
+VALID_PREFIXES = ("search for", "go near", "pickup", "open", "close", "drop")
 
 
 class LLMPlanner:

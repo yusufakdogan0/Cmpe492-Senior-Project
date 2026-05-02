@@ -10,18 +10,28 @@ Supports four environment families:
   - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (1 stage)
   - MiniGrid-UnlockPickup-v0             (6 stages)
 
+Two training modes:
+  - Single-env (--env): all 16 worker envs run the same task. Backward
+    compatible with previous CSV/checkpoint formats.
+  - Mixed-task (--mix, paper §4.5): worker envs are split across multiple
+    env types according to a ratio, e.g. 4 UnlockPickup + 12 GoToObject.
+    Used to bootstrap UnlockPickup convergence by giving the agent dense
+    rewards from the easier task while it learns the harder one.
+
 Artifact naming:
   - DoorKey-5x5 (legacy default) keeps base names:
       checkpoints/lgrl_rule.pt, logs/lgrl_rule_metrics.csv, ...
-  - Other envs are suffixed:
-      checkpoints/lgrl_rule_gotodoor5x5.pt,
-      checkpoints/lgrl_rule_unlockpickup.pt, etc.
+  - Other single envs are suffixed:
+      checkpoints/lgrl_rule_unlockpickup.pt, ...
+  - Mix runs are prefixed with "mix" + env tags + ratios:
+      checkpoints/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3.pt
 
 Usage:
     python scripts/train_lgrl_rule.py
     python scripts/train_lgrl_rule.py --env MiniGrid-GoToDoor-5x5-v0
-    python scripts/train_lgrl_rule.py --env MiniGrid-GoToObject-6x6-N2-v0
     python scripts/train_lgrl_rule.py --env MiniGrid-UnlockPickup-v0
+    python scripts/train_lgrl_rule.py \\
+        --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
     python scripts/train_lgrl_rule.py --resume
     python scripts/train_lgrl_rule.py --subgoal-log
 """
@@ -61,6 +71,9 @@ from utils.env_utils import (
     LEGACY_DEFAULT_ENV,
     env_max_steps,
     resolve_artifact_stem,
+    parse_mix_spec,
+    build_env_list,
+    mix_artifact_stem,
 )
 from utils.rule_based_planner import RuleBasedPlanner
 from utils.subgoal_tracker import SubgoalTracker
@@ -112,11 +125,23 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Train LGRL with the deterministic rule-based subgoal planner."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--env",
         default=DEFAULT_ENV,
         choices=SUPPORTED_ENVS,
         help=f"MiniGrid environment id (default: {DEFAULT_ENV})",
+    )
+    mode.add_argument(
+        "--mix",
+        default=None,
+        type=str,
+        metavar="SPEC",
+        help=(
+            "Mixed-task spec: 'env1:r1,env2:r2'. Total ratio must divide "
+            "NUM_ENVS evenly. Example (paper §4.5): "
+            "'MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3'"
+        ),
     )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--subgoal-log", action="store_true", default=False)
@@ -133,6 +158,21 @@ class HierarchyState:
     The stage index only advances forward — once a stage is completed
     (or timed out), the planner is queried with the next stage index,
     preventing the agent from farming rewards on repeated subgoals.
+
+    Per-env config (lists of length ``num_envs``):
+      - ``n_subgoals_per_env[i]``  — stage count for env i's mission family
+      - ``t_max_per_env[i]``       — env i's ``unwrapped.max_steps``
+      - ``family_per_env[i]``      — mission family label (for per-family
+                                      metrics in mixed-task training)
+
+    In single-env mode all entries are identical; in mixed-task mode they
+    differ across env_idx.
+
+    Per-episode tracking (drained by the training loop each update):
+      - ``episode_return_so_far[i]`` — accumulated shaped reward this ep
+      - ``completed_episodes``       — list[(family, return, steps, success)]
+                                        cleared by the training loop after
+                                        each rollout.
     """
 
     def __init__(
@@ -141,14 +181,19 @@ class HierarchyState:
         planner: RuleBasedPlanner,
         envs: list,
         *,
-        n_subgoals: int,
-        t_max: int,
+        n_subgoals_per_env: list[int],
+        t_max_per_env: list[int],
+        family_per_env: list[str],
     ):
+        assert len(n_subgoals_per_env) == num_envs
+        assert len(t_max_per_env) == num_envs
+        assert len(family_per_env) == num_envs
         self.num_envs = num_envs
         self.planner = planner
         self.envs = envs
-        self.n_subgoals = n_subgoals
-        self.t_max = t_max
+        self.n_subgoals_per_env = n_subgoals_per_env
+        self.t_max_per_env = t_max_per_env
+        self.family_per_env = family_per_env
         self._init_lists()
 
     def _init_lists(self):
@@ -156,10 +201,13 @@ class HierarchyState:
         self.stage_indices: list[int] = [0] * self.num_envs
         self.step_counters: list[int] = [0] * self.num_envs
         self.episode_steps: list[int] = [0] * self.num_envs
+        self.episode_return_so_far: list[float] = [0.0] * self.num_envs
         self.trackers: list[SubgoalTracker] = [
             SubgoalTracker() for _ in range(self.num_envs)
         ]
         self.histories: list[list[dict]] = [[] for _ in range(self.num_envs)]
+        # Drained by the training loop once per update:
+        self.completed_episodes: list[tuple[str, float, int, bool]] = []
 
     def init_env_subgoal(self, env_idx: int, obs: dict):
         """Query planner for the initial subgoal at stage 0."""
@@ -176,23 +224,33 @@ class HierarchyState:
         self.stage_indices[env_idx] = 0
         self.step_counters[env_idx] = 0
         self.episode_steps[env_idx] = 0
+        self.episode_return_so_far[env_idx] = 0.0
         self.trackers[env_idx].reset()
         self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """T_i = (i/n) * T_max  (paper Eq. 6), using 1-indexed stage."""
-        i = min(self.stage_indices[env_idx] + 1, self.n_subgoals)
-        return (i / self.n_subgoals) * self.t_max
+        """T_i = (i/n) * T_max  (paper Eq. 6), using per-env n and T_max."""
+        n = self.n_subgoals_per_env[env_idx]
+        t_max = self.t_max_per_env[env_idx]
+        i = min(self.stage_indices[env_idx] + 1, n)
+        return (i / n) * t_max
+
+    def n_subgoals(self, env_idx: int) -> int:
+        return self.n_subgoals_per_env[env_idx]
+
+    def t_max(self, env_idx: int) -> int:
+        return self.t_max_per_env[env_idx]
 
     def advance(self, env_idx: int, obs: dict):
         """Advance to the next stage and query the planner."""
         next_stage = self.stage_indices[env_idx] + 1
-        if next_stage >= self.n_subgoals:
+        n = self.n_subgoals_per_env[env_idx]
+        if next_stage >= n:
             # All stages done — no more subgoal rewards.
             # Keep the last active subgoal visible to the agent's text
             # stream (do not overwrite), so the policy still has a useful
             # conditioning signal while it finishes the mission.
-            self.stage_indices[env_idx] = self.n_subgoals
+            self.stage_indices[env_idx] = n
             self.step_counters[env_idx] = 0
             return
 
@@ -249,7 +307,8 @@ def make_env(env_name: str, seed: int):
 
 def make_reshape_reward(hierarchy_state, logger=None):
     """Build the reward callback. Stage-based: each stage can only be
-    completed once per episode."""
+    completed once per episode. Per-env n_subgoals and T_max so that
+    mixed-task training (paper §4.5) works correctly."""
 
     def reshape_reward(obs, action, reward, done):
         env_idx = reshape_reward._current_env_idx
@@ -260,23 +319,35 @@ def make_reshape_reward(hierarchy_state, logger=None):
         hierarchy_state.episode_steps[env_idx] += 1
         mission = obs.get("mission", "")
 
+        n_subgoals = hierarchy_state.n_subgoals(env_idx)
+        t_max = hierarchy_state.t_max(env_idx)
+
         if done:
             success = reward > 0
             if success:
                 # Paper Eq. 5: rm = Rm * (1 - 0.5 * Tused/Tmax)
                 t_total = hierarchy_state.episode_steps[env_idx]
-                ratio = min(t_total / hierarchy_state.t_max, 1.0)
+                ratio = min(t_total / t_max, 1.0)
                 total_reward += R_MISSION * (1.0 - MISSION_TIME_COEF * ratio)
             if logger:
                 logger.on_episode_end(
                     env_idx, mission, success,
                     hierarchy_state.episode_steps[env_idx],
                 )
+            # Push completed-episode record for per-family aggregation
+            ep_return = hierarchy_state.episode_return_so_far[env_idx] + total_reward
+            hierarchy_state.completed_episodes.append((
+                hierarchy_state.family_per_env[env_idx],
+                ep_return,
+                hierarchy_state.episode_steps[env_idx],
+                success,
+            ))
             hierarchy_state.reset_env(env_idx)
             return total_reward
 
         # If all stages exhausted, no subgoal checking
-        if hierarchy_state.stage_indices[env_idx] >= hierarchy_state.n_subgoals:
+        if hierarchy_state.stage_indices[env_idx] >= n_subgoals:
+            hierarchy_state.episode_return_so_far[env_idx] += total_reward
             return total_reward
 
         # Initialize subgoal on first step if needed
@@ -308,7 +379,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
             ratio = min(t_used / max(t_budget, 1), SUBGOAL_TIMEOUT_MULT)
             r_i = max(R_SUBGOAL * (1.0 - SUBGOAL_TIME_COEF * ratio), 0.0)
             # Paper Eq. 7: normalize by n
-            total_reward += r_i / hierarchy_state.n_subgoals
+            total_reward += r_i / n_subgoals
 
             hierarchy_state.histories[env_idx].append(
                 {"subgoal": subgoal, "status": "Success", "steps": t_used,
@@ -319,7 +390,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
                     env_idx, "completed", mission=mission, subgoal=subgoal,
                     stage=hierarchy_state.stage_indices[env_idx],
                     steps_used=t_used, budget=t_budget,
-                    reward=r_i / hierarchy_state.n_subgoals,
+                    reward=r_i / n_subgoals,
                 )
             hierarchy_state.advance(env_idx, obs)
             if logger:
@@ -360,6 +431,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
                     raw_llm=getattr(hierarchy_state.planner, "last_raw_response", None),
                 )
 
+        hierarchy_state.episode_return_so_far[env_idx] += total_reward
         return total_reward
 
     reshape_reward._current_env_idx = 0
@@ -385,21 +457,44 @@ def save_plots(history, plot_dir, artifact_stem, env_name):
     if len(frames) < 2:
         return
 
+    # Detect per-family columns (mix-mode only). A column ending in
+    # "_avg_return" that isn't the global "avg_return" denotes a family.
+    family_keys = sorted({
+        k[: -len("_avg_return")]
+        for k in history
+        if k.endswith("_avg_return") and k != "avg_return"
+    })
+    is_mix = bool(family_keys)
+    family_colors = ["tab:purple", "tab:cyan", "tab:olive", "tab:pink", "tab:brown"]
+
     fig, axes = plt.subplots(2, 2, figsize=(14, 9))
+    title_suffix = " (mixed-task)" if is_mix else ""
     fig.suptitle(
-        f"LGRL PPO (rule oracle, stage-based) -- {env_name}",
+        f"LGRL PPO (rule oracle, stage-based){title_suffix} -- {env_name}",
         fontsize=14, fontweight="bold",
     )
 
+    # Panel 0,0 — Average return (global + per-family in mix mode)
     ax = axes[0, 0]
-    ax.plot(frames, history["avg_return"], alpha=0.3, color="tab:blue", linewidth=0.5)
-    ax.plot(frames, _smooth(history["avg_return"]), color="tab:blue", linewidth=1.5, label="Smoothed")
+    ax.plot(frames, history["avg_return"], alpha=0.25, color="tab:blue", linewidth=0.5)
+    ax.plot(frames, _smooth(history["avg_return"]), color="tab:blue", linewidth=1.8,
+            label="Global (smoothed)")
+    for i, fam in enumerate(family_keys):
+        col = family_colors[i % len(family_colors)]
+        ax.plot(frames, _smooth(history[f"{fam}_avg_return"]), color=col, linewidth=1.4,
+                label=f"{fam}")
     ax.set(xlabel="Frames", ylabel="Average Return", title="Average Return per Episode")
     ax.legend(); ax.grid(True, alpha=0.3)
 
+    # Panel 0,1 — Average steps (global + per-family in mix mode)
     ax = axes[0, 1]
-    ax.plot(frames, history["avg_steps"], alpha=0.3, color="tab:orange", linewidth=0.5)
-    ax.plot(frames, _smooth(history["avg_steps"]), color="tab:orange", linewidth=1.5, label="Smoothed")
+    ax.plot(frames, history["avg_steps"], alpha=0.25, color="tab:orange", linewidth=0.5)
+    ax.plot(frames, _smooth(history["avg_steps"]), color="tab:orange", linewidth=1.8,
+            label="Global (smoothed)")
+    for i, fam in enumerate(family_keys):
+        col = family_colors[i % len(family_colors)]
+        ax.plot(frames, _smooth(history[f"{fam}_avg_steps"]), color=col, linewidth=1.4,
+                label=f"{fam}")
     ax.set(xlabel="Frames", ylabel="Average Steps", title="Average Steps per Episode")
     ax.legend(); ax.grid(True, alpha=0.3)
 
@@ -419,7 +514,8 @@ def save_plots(history, plot_dir, artifact_stem, env_name):
     plt.close(fig)
 
 
-def _save_checkpoint(path, model, algo, vocab, update, total_frames, env_name):
+def _save_checkpoint(path, model, algo, vocab, update, total_frames,
+                     env_name, mix_spec=None):
     torch.save(
         {
             "model_state_dict": model.state_dict(),
@@ -428,7 +524,8 @@ def _save_checkpoint(path, model, algo, vocab, update, total_frames, env_name):
             "update": update,
             "total_frames": total_frames,
             "planner": PLANNER_TAG,
-            "env": env_name,
+            "env": env_name,             # None in mix mode
+            "mix": mix_spec,             # None in single-env mode
         },
         path,
     )
@@ -452,46 +549,106 @@ def _load_history_from_csv(csv_path, csv_fields):
 
 def main():
     args = parse_args()
-    env_name = args.env
 
-    # Per-env derived config
-    t_max = env_max_steps(env_name)
-    artifact_stem = resolve_artifact_stem(BASE_ARTIFACT_STEM, env_name)
+    # ---- Resolve env config (single or mix) ----------------------------
+    if args.mix:
+        mix = parse_mix_spec(args.mix)
+        env_list = build_env_list(mix, NUM_ENVS)
+        artifact_stem = mix_artifact_stem(BASE_ARTIFACT_STEM, mix)
+        env_name = None  # not a single env
+        run_label = f"mix [{args.mix}]"
+    else:
+        env_name = args.env
+        env_list = [env_name] * NUM_ENVS
+        artifact_stem = resolve_artifact_stem(BASE_ARTIFACT_STEM, env_name)
+        mix = None
+        run_label = env_name
 
-    # Probe a sample mission to determine stage count for this env family.
-    # All episodes in a single env use the same mission family, so N is
-    # determined once at startup and stays constant.
-    sample_env = gym.make(env_name)
-    sample_obs, _ = sample_env.reset()
-    sample_env.close()
-    n_subgoals = RuleBasedPlanner.num_stages(sample_obs["mission"])
+    # ---- Per-env config (probe each unique env for n_subgoals & T_max) -
+    # Cache (mission, n_subgoals, t_max) per env name so we only probe once.
+    seen_env_cfg: dict[str, tuple[str, int, int, str]] = {}
+    sample_obs_for_vocab: list[dict] = []
+    for env_name_i in env_list:
+        if env_name_i in seen_env_cfg:
+            continue
+        sample_env = gym.make(env_name_i)
+        sample_obs_i, _ = sample_env.reset()
+        sample_env.close()
+        mission_i = sample_obs_i["mission"]
+        n_i = RuleBasedPlanner.num_stages(mission_i)
+        t_i = env_max_steps(env_name_i)
+        family_i = RuleBasedPlanner.classify_mission(mission_i)
+        seen_env_cfg[env_name_i] = (mission_i, n_i, t_i, family_i)
+        sample_obs_for_vocab.append(sample_obs_i)
+
+    n_subgoals_per_env = [seen_env_cfg[e][1] for e in env_list]
+    t_max_per_env = [seen_env_cfg[e][2] for e in env_list]
+    family_per_env = [seen_env_cfg[e][3] for e in env_list]
+    families_in_run = sorted(set(family_per_env))
 
     csv_path = os.path.join(LOG_DIR, f"{artifact_stem}_metrics.csv")
     checkpoint_path = os.path.join(CHECKPOINT_DIR, f"{artifact_stem}.pt")
 
+    # ---- Build CSV field list dynamically -----------------------------
+    # Single-env mode keeps the legacy CSV exactly. Mix mode appends
+    # per-family columns so UnlockPickup convergence can be tracked
+    # independently from GoToObject.
+    base_fields = [
+        "update", "frames", "avg_return", "avg_steps",
+        "entropy", "policy_loss", "value_loss", "elapsed_sec",
+    ]
+    if mix is not None:
+        family_fields = []
+        for fam in families_in_run:
+            family_fields += [
+                f"{fam}_episodes",
+                f"{fam}_avg_return",
+                f"{fam}_avg_steps",
+                f"{fam}_success_rate",
+            ]
+        csv_fields = base_fields + family_fields
+    else:
+        csv_fields = base_fields
+
+    # ---- Banner -------------------------------------------------------
     print("=" * 70)
     print("  LGRL PPO Training (rule oracle, stage-based)")
     print("=" * 70)
-    print(f"  Env            : {env_name}")
+    print(f"  Mode           : {'mixed-task' if mix else 'single-env'}")
+    print(f"  Run            : {run_label}")
     print(f"  Artifact stem  : {artifact_stem}")
     print(f"  Device         : {DEVICE}")
-    print(f"  Envs           : {NUM_ENVS} parallel")
     print(f"  Frames         : {TOTAL_FRAMES:,}")
-    print(f"  Planner        : {PLANNER_TAG} (stage-based, {n_subgoals} stages)")
-    print(f"  T_max          : {t_max}  (from env.unwrapped.max_steps)")
+    print(f"  Planner        : {PLANNER_TAG}")
+    print(f"  Envs ({NUM_ENVS}):")
+    if mix:
+        # Show per-env-name composition
+        from collections import Counter
+        cnt = Counter(env_list)
+        for env_name_i in seen_env_cfg:
+            mission_i, n_i, t_i, fam_i = seen_env_cfg[env_name_i]
+            print(
+                f"    {cnt[env_name_i]:2d}x {env_name_i:35s} "
+                f"family={fam_i:13s} stages={n_i} T_max={t_i}"
+            )
+    else:
+        mission_i, n_i, t_i, fam_i = seen_env_cfg[env_list[0]]
+        print(f"    {NUM_ENVS:2d}x {env_list[0]:35s} "
+              f"family={fam_i:13s} stages={n_i} T_max={t_i}")
     print(f"  R_mission      : {R_MISSION}")
     print(f"  R_subgoal      : {R_SUBGOAL}")
-    print(f"  Subgoal budget : T_i = ((stage+1)/{n_subgoals}) * {t_max}")
     print("=" * 70)
 
-    envs = [make_env(env_name, seed=i) for i in range(NUM_ENVS)]
+    # ---- Build envs ---------------------------------------------------
+    envs = [make_env(env_list[i], seed=i) for i in range(NUM_ENVS)]
 
+    # ---- Vocab (pre-seed with one sample mission per unique env) ------
     vocab = Vocabulary()
-    # Pre-seed the vocab with a representative "mission [SEP] subgoal"
-    # from each env family so common tokens are present before training.
-    vocab.tokenize(
-        f"{sample_obs['mission']} [SEP] search for the target", max_len=32
-    )
+    for sample_obs_i in sample_obs_for_vocab:
+        vocab.tokenize(
+            f"{sample_obs_i['mission']} [SEP] search for the target",
+            max_len=32,
+        )
 
     obs_space = envs[0].observation_space
     act_space = envs[0].action_space
@@ -505,7 +662,9 @@ def main():
     planner = RuleBasedPlanner()
     hierarchy_state = HierarchyState(
         NUM_ENVS, planner, envs,
-        n_subgoals=n_subgoals, t_max=t_max,
+        n_subgoals_per_env=n_subgoals_per_env,
+        t_max_per_env=t_max_per_env,
+        family_per_env=family_per_env,
     )
 
     logger = (
@@ -544,11 +703,7 @@ def main():
     frames_per_update = NUM_ENVS * NUM_FRAMES_PER_PROC
     start_time = time.time()
 
-    csv_fields = [
-        "update", "frames", "avg_return", "avg_steps",
-        "entropy", "policy_loss", "value_loss", "elapsed_sec",
-    ]
-
+    # ---- Resume / fresh start -----------------------------------------
     if args.resume and os.path.exists(checkpoint_path):
         ckpt = torch.load(checkpoint_path, map_location=DEVICE, weights_only=False)
         saved = ckpt.get("planner")
@@ -556,11 +711,19 @@ def main():
             raise SystemExit(
                 f"Checkpoint planner mismatch: expected {PLANNER_TAG!r}, got {saved!r}."
             )
-        saved_env = ckpt.get("env")
-        if saved_env is not None and saved_env != env_name:
-            raise SystemExit(
-                f"Checkpoint env mismatch: expected {env_name!r}, got {saved_env!r}."
-            )
+        # Validate env / mix consistency
+        if mix is not None:
+            saved_mix = ckpt.get("mix")
+            if saved_mix is not None and saved_mix != args.mix:
+                raise SystemExit(
+                    f"Checkpoint mix mismatch: expected {args.mix!r}, got {saved_mix!r}."
+                )
+        else:
+            saved_env = ckpt.get("env")
+            if saved_env is not None and saved_env != env_name:
+                raise SystemExit(
+                    f"Checkpoint env mismatch: expected {env_name!r}, got {saved_env!r}."
+                )
         model.load_state_dict(ckpt["model_state_dict"])
         if "optimizer_state_dict" in ckpt:
             algo.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -602,18 +765,62 @@ def main():
         value_loss = np.mean(update_logs["value_loss"])
         elapsed = time.time() - start_time
 
+        # Drain per-family episode records collected this rollout
+        per_family_stats: dict[str, dict] = {}
+        if hierarchy_state.completed_episodes:
+            from collections import defaultdict
+            buckets = defaultdict(list)
+            for fam, ep_ret, ep_steps, ep_ok in hierarchy_state.completed_episodes:
+                buckets[fam].append((ep_ret, ep_steps, ep_ok))
+            for fam, recs in buckets.items():
+                rets = [r for r, _, _ in recs]
+                stps = [s for _, s, _ in recs]
+                oks = [int(o) for _, _, o in recs]
+                per_family_stats[fam] = {
+                    "episodes": len(recs),
+                    "avg_return": float(np.mean(rets)),
+                    "avg_steps": float(np.mean(stps)),
+                    "success_rate": float(np.mean(oks)),
+                }
+            hierarchy_state.completed_episodes.clear()
+
         print(
             f"{update:>7} | {total_frames:>10,} | {avg_return:>11.3f} | "
             f"{avg_steps:>10.1f} | {entropy:>8.4f} | {policy_loss:>12.4f} | "
             f"{value_loss:>11.4f}"
         )
+        # Per-family breakdown printed only in mix mode (in single mode
+        # the global numbers above are already per-family).
+        if mix is not None and per_family_stats:
+            for fam in families_in_run:
+                if fam in per_family_stats:
+                    s = per_family_stats[fam]
+                    print(
+                        f"          {fam:13s} eps={s['episodes']:>3d} "
+                        f"avg_return={s['avg_return']:>7.3f} "
+                        f"avg_steps={s['avg_steps']:>6.1f} "
+                        f"success={s['success_rate']*100:>5.1f}%"
+                    )
+                else:
+                    print(f"          {fam:13s} eps=  0 (no completions)")
 
+        # Build CSV row
         row = {
             "update": update, "frames": total_frames,
             "avg_return": f"{avg_return:.6f}", "avg_steps": f"{avg_steps:.1f}",
             "entropy": f"{entropy:.6f}", "policy_loss": f"{policy_loss:.6f}",
             "value_loss": f"{value_loss:.6f}", "elapsed_sec": f"{elapsed:.1f}",
         }
+        if mix is not None:
+            for fam in families_in_run:
+                s = per_family_stats.get(fam, {
+                    "episodes": 0, "avg_return": 0.0,
+                    "avg_steps": 0.0, "success_rate": 0.0,
+                })
+                row[f"{fam}_episodes"] = s["episodes"]
+                row[f"{fam}_avg_return"] = f"{s['avg_return']:.6f}"
+                row[f"{fam}_avg_steps"] = f"{s['avg_steps']:.1f}"
+                row[f"{fam}_success_rate"] = f"{s['success_rate']:.4f}"
         csv_writer.writerow(row)
         csv_file.flush()
         for k, v in row.items():
@@ -621,19 +828,21 @@ def main():
 
         if update % CHECKPOINT_EVERY == 0:
             _save_checkpoint(
-                checkpoint_path, model, algo, vocab, update, total_frames, env_name
+                checkpoint_path, model, algo, vocab, update, total_frames,
+                env_name=env_name, mix_spec=args.mix,
             )
 
         if update % PLOT_EVERY == 0:
-            save_plots(history, PLOT_DIR, artifact_stem, env_name)
+            save_plots(history, PLOT_DIR, artifact_stem, run_label)
 
     _save_checkpoint(
-        checkpoint_path, model, algo, vocab, update, total_frames, env_name
+        checkpoint_path, model, algo, vocab, update, total_frames,
+        env_name=env_name, mix_spec=args.mix,
     )
     csv_file.close()
     if logger is not None:
         logger.close()
-    save_plots(history, PLOT_DIR, artifact_stem, env_name)
+    save_plots(history, PLOT_DIR, artifact_stem, run_label)
 
     print("\nTraining complete.")
     print(f"  Checkpoint : {checkpoint_path}")

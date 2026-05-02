@@ -162,6 +162,40 @@ Artifacts for DoorKey-5x5:
 
 For any other env, swap `lgrl_rule` → `lgrl_rule_<envtag>`.
 
+### Mixed-task training (paper §4.5)
+
+The paper does **not** train UnlockPickup standalone from scratch. The reward is too sparse for random exploration to bootstrap (a uniform-random policy effectively never solves an episode within `T_max`, so PPO has no learning signal). Two setups are reported instead:
+
+- §4.4 (Table 2): UnlockPickup is tested as **zero-shot transfer** from a KeyCorridor-trained agent.
+- §4.5 (single-step convergence, Fig. 3): UnlockPickup is trained **mixed** with `GoToObject` at a 1:3 ratio. The easy task gives the agent dense reward signal for navigation while it learns the harder task.
+
+`--mix` is mutually exclusive with `--env`. Format: `env1:r1,env2:r2`. The total ratio must divide `NUM_ENVS=16` evenly. With ratio 1:3 you get 4 UnlockPickup + 12 GoToObject worker envs. All three training scripts support it identically:
+
+```bash
+python scripts/train_lgrl_rule.py \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+
+python scripts/train_lgrl.py --planner llm \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+
+python scripts/train_baseline.py \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+```
+
+In mix mode, the per-update stdout breakdown shows each family's episode count, return, steps, and success rate independently. The CSV gains four columns per family — `<fam>_episodes`, `<fam>_avg_return`, `<fam>_avg_steps`, `<fam>_success_rate` — so UnlockPickup convergence can be tracked without being washed out by the much-easier GoToObject episodes that dominate the global average. The plot panels for return and steps overlay per-family curves on the global curve.
+
+Mix-mode artifacts:
+
+| Artifact     | Path                                                                       |
+|--------------|----------------------------------------------------------------------------|
+| Metrics CSV  | `logs/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3_metrics.csv`         |
+| Checkpoint   | `checkpoints/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3.pt`           |
+| Plot         | `logs/plots/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3_training_curves.png` |
+
+Stem format: `<base>_mix_<env1tag>_<env2tag>_<r1>to<r2>`. Different mixes get distinct artifact paths so multiple ratio experiments don't clobber each other. Resume validates that the saved mix spec matches the requested one.
+
+Single-env runs (`--env`) keep their original CSV format and artifact paths byte-for-byte; mix-mode CSV is a strict superset.
+
 ## Architecture
 
 The agent operates in a bi-level hierarchy:

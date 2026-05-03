@@ -1,9 +1,9 @@
 """
 Deterministic rule-based subgoal generator for MiniGrid environments.
 
-Implements forward-only stage machines that produce exactly the subgoal
-types from the LGRL paper: search for, pickup, open, close, drop.
-No "explore" or "go to" subgoals.
+Implements forward-only stage machines that produce the subgoal types
+from the LGRL paper plus "go near": search for, go near, pickup, open,
+close, drop. No "explore" or "go to" subgoals.
 
 Supported environments:
 
@@ -14,20 +14,25 @@ Supported environments:
     Stage 3 — open the locked [color] door
     Stage 4 — search for the goal
 
-  GoToDoor-*  (1 stage)
-    Stage 0 — search for the [color] door
+  GoToDoor-*  (2 stages)
+    Stage 0 — search for the [color] door  (skipped if door visible)
+    Stage 1 — go near the [color] door     (agent adjacent to target)
 
-  GoToObject-*  (1 stage)
-    Stage 0 — search for the [color] [object]
+  GoToObject-*  (2 stages)
+    Stage 0 — search for the [color] [object]  (skipped if object visible)
+    Stage 1 — go near the [color] [object]     (agent adjacent to target)
               where [object] is one of {key, ball, box}
 
-  UnlockPickup-* (6 stages)
+  UnlockPickup-* (9 stages)
     Stage 0 — search for the [key_color] key       (skipped if visible/carried)
-    Stage 1 — pickup the [key_color] key           (skipped if already carried)
-    Stage 2 — search for the [door_color] door     (skipped if door visible)
-    Stage 3 — open the locked [door_color] door    (skipped if door open)
-    Stage 4 — search for the [target_color] [obj]  (skipped if target visible)
-    Stage 5 — pickup the [target_color] [obj]
+    Stage 1 — go near the [key_color] key          (skipped if already carried)
+    Stage 2 — pickup the [key_color] key           (skipped if already carried)
+    Stage 3 — search for the [door_color] door     (skipped if door visible)
+    Stage 4 — go near the [door_color] door        (skipped if door already open)
+    Stage 5 — open the locked [door_color] door    (skipped if door open)
+    Stage 6 — search for the [target_color] [obj]  (skipped if target visible)
+    Stage 7 — go near the [target_color] [obj]     (skipped if target carried)
+    Stage 8 — pickup the [target_color] [obj]
 
     Note: the key/door color is inferred from the observation (it is NOT in
     the mission text). The target color and object type come from the
@@ -46,8 +51,8 @@ KNOWN_OBJECTS = {"key", "ball", "box", "door", "goal"}
 
 # Per-mission-family stage counts (paper Eq. 6 n)
 DOORKEY_STAGES = 5
-GOTO_STAGES = 1
-UNLOCKPICKUP_STAGES = 6
+GOTO_STAGES = 2
+UNLOCKPICKUP_STAGES = 9
 
 
 class RuleBasedPlanner:
@@ -226,77 +231,99 @@ class RuleBasedPlanner:
     def _gotodoor_stages(
         self, stage: int, mission: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Single-stage planner for GoToDoor.
+        """Two-stage planner for GoToDoor.
 
         Mission: "go to the <color> door"
-        Subgoal: "search for the <color> door"
+        Stage 0 — search for the <color> door  (door enters FOV)
+        Stage 1 — go near the <color> door     (agent adjacent)
 
         The mission is solved by executing `done` next to the target door;
         the mission-level reward (Eq. 5) handles that terminal action.
-        The single subgoal rewards the agent for bringing the door into
-        its field of view.
         """
         color = _mission_color(mission)
-        label = (
+        search_label = (
             f"search for the {color} door" if color else "search for the door"
         )
+        near_label = (
+            f"go near the {color} door" if color else "go near the door"
+        )
 
+        # --- Stage 0: search for door ---
         if stage <= 0:
-            return label, 0
+            target_doors = _find_entities(entities, obj_type="door", color=color or None)
+            if target_doors:
+                return self._gotodoor_stages(1, mission, entities)
+            return search_label, 0
 
-        # Past the only stage — keep the same subgoal visible to the agent's
-        # text stream. The training loop's stage_index >= n_subgoals check
-        # prevents further subgoal completion rewards.
-        return label, GOTO_STAGES
+        # --- Stage 1: go near door ---
+        if stage <= 1:
+            return near_label, 1
+
+        # All stages exhausted — keep the near subgoal visible
+        return near_label, GOTO_STAGES
 
     # -- GoToObject stage machine --------------------------------------
 
     def _gotoobject_stages(
         self, stage: int, mission: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Single-stage planner for GoToObject.
+        """Two-stage planner for GoToObject.
 
         Mission: "go to the <color> <key|ball|box>"
-        Subgoal: "search for the <color> <key|ball|box>"
-
-        The object type is parsed from the mission string so the subgoal
-        tracker can verify the specific target, not just any object of
-        matching color.
+        Stage 0 — search for the <color> <object>  (object enters FOV)
+        Stage 1 — go near the <color> <object>     (agent adjacent)
         """
         color = _mission_color(mission)
         obj_type = _mission_object(mission)
 
         if color and obj_type:
-            label = f"search for the {color} {obj_type}"
+            search_label = f"search for the {color} {obj_type}"
+            near_label = f"go near the {color} {obj_type}"
         elif obj_type:
-            label = f"search for the {obj_type}"
+            search_label = f"search for the {obj_type}"
+            near_label = f"go near the {obj_type}"
         else:
-            label = "search for the object"
+            search_label = "search for the object"
+            near_label = "go near the object"
 
+        # --- Stage 0: search for object ---
         if stage <= 0:
-            return label, 0
+            target = _find_entities(
+                entities, obj_type=obj_type, color=color or None
+            )
+            if target:
+                return self._gotoobject_stages(1, mission, entities)
+            return search_label, 0
 
-        # Past the only stage — keep the same subgoal visible
-        return label, GOTO_STAGES
+        # --- Stage 1: go near object ---
+        if stage <= 1:
+            return near_label, 1
+
+        # All stages exhausted — keep the near subgoal visible
+        return near_label, GOTO_STAGES
 
     # -- UnlockPickup stage machine ------------------------------------
 
     def _unlockpickup_stages(
         self, stage: int, mission: str, inventory: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Six-stage planner for UnlockPickup.
+        """Nine-stage planner for UnlockPickup.
 
         Mission: "pick up the <target_color> <target_object>"
         (target_object is typically "box" in MiniGrid-UnlockPickup-v0).
 
         Stages:
-          0 — search for the <key_color> key      (skip if key visible/carried)
-          1 — pickup the <key_color> key          (skip if already carried)
-          2 — search for the <door_color> door    (skip if door visible)
-          3 — open the locked <door_color> door   (skip if door already open)
-          4 — search for the <target_color> <target_object>
-                                                  (skip if target visible/carried)
-          5 — pickup the <target_color> <target_object>
+          0 — search for the <key_color> key       (skip if key visible/carried)
+          1 — go near the <key_color> key          (skip if already carried)
+          2 — pickup the <key_color> key           (skip if already carried)
+          3 — search for the <door_color> door     (skip if door visible)
+          4 — go near the <door_color> door        (skip if door already open)
+          5 — open the locked <door_color> door    (skip if door already open)
+          6 — search for the <target_color> <target_object>
+                                                   (skip if target visible/carried)
+          7 — go near the <target_color> <target_object>
+                                                   (skip if target carried)
+          8 — pickup the <target_color> <target_object>
 
         Color handling: the key/door color is inferred from the observation
         (a visible key, or a visible door) — it is NOT in the mission text.
@@ -313,7 +340,7 @@ class RuleBasedPlanner:
         target_type = _mission_object(mission)
 
         # Are we already carrying the target object?
-        carrying_target = (
+        carrying_target = bool(
             target_type
             and target_type in inv_words
             and (not target_color or target_color in inv_words)
@@ -350,67 +377,99 @@ class RuleBasedPlanner:
         # --- Stage 0: search for the key ---
         if stage <= 0:
             if carrying_key:
-                return self._unlockpickup_stages(2, mission, inventory, entities)
+                return self._unlockpickup_stages(3, mission, inventory, entities)
             if keys:
                 return self._unlockpickup_stages(1, mission, inventory, entities)
             color = key_color or door_color
             label = f"search for the {color} key" if color else "search for the key"
             return label, 0
 
-        # --- Stage 1: pickup the key ---
+        # --- Stage 1: go near the key ---
         if stage <= 1:
             if carrying_key:
-                return self._unlockpickup_stages(2, mission, inventory, entities)
+                return self._unlockpickup_stages(3, mission, inventory, entities)
             color = key_color or door_color
-            label = f"pickup the {color} key" if color else "pickup the key"
+            label = f"go near the {color} key" if color else "go near the key"
             return label, 1
 
-        # --- Stage 2: search for the door ---
+        # --- Stage 2: pickup the key ---
         if stage <= 2:
-            if locked_doors:
+            if carrying_key:
                 return self._unlockpickup_stages(3, mission, inventory, entities)
+            color = key_color or door_color
+            label = f"pickup the {color} key" if color else "pickup the key"
+            return label, 2
+
+        # --- Stage 3: search for the door ---
+        if stage <= 3:
+            if locked_doors:
+                return self._unlockpickup_stages(4, mission, inventory, entities)
             if open_doors:
                 # Door already open (e.g. opened earlier this episode) —
-                # skip past Stage 3.
-                return self._unlockpickup_stages(4, mission, inventory, entities)
+                # skip past the go-near-door and open-door stages.
+                return self._unlockpickup_stages(6, mission, inventory, entities)
             color = door_color or key_color
             label = (
                 f"search for the {color} door" if color else "search for the door"
             )
-            return label, 2
+            return label, 3
 
-        # --- Stage 3: open the locked door ---
-        if stage <= 3:
+        # --- Stage 4: go near the door ---
+        if stage <= 4:
             if open_doors:
-                return self._unlockpickup_stages(4, mission, inventory, entities)
+                return self._unlockpickup_stages(6, mission, inventory, entities)
+            color = door_color or key_color
+            label = (
+                f"go near the {color} door" if color else "go near the door"
+            )
+            return label, 4
+
+        # --- Stage 5: open the locked door ---
+        if stage <= 5:
+            if open_doors:
+                return self._unlockpickup_stages(6, mission, inventory, entities)
             color = door_color or key_color
             label = (
                 f"open the locked {color} door"
                 if color else "open the locked door"
             )
-            return label, 3
+            return label, 5
 
-        # --- Stage 4: search for the target object ---
-        if stage <= 4:
-            if carrying_target or target_visible:
-                return self._unlockpickup_stages(5, mission, inventory, entities)
+        # --- Stage 6: search for the target object ---
+        if stage <= 6:
+            if carrying_target:
+                return self._unlockpickup_stages(8, mission, inventory, entities)
+            if target_visible:
+                return self._unlockpickup_stages(7, mission, inventory, entities)
             if target_color and target_type:
                 label = f"search for the {target_color} {target_type}"
             elif target_type:
                 label = f"search for the {target_type}"
             else:
                 label = "search for the target"
-            return label, 4
+            return label, 6
 
-        # --- Stage 5: pickup the target object ---
-        if stage <= 5:
+        # --- Stage 7: go near the target object ---
+        if stage <= 7:
+            if carrying_target:
+                return self._unlockpickup_stages(8, mission, inventory, entities)
+            if target_color and target_type:
+                label = f"go near the {target_color} {target_type}"
+            elif target_type:
+                label = f"go near the {target_type}"
+            else:
+                label = "go near the target"
+            return label, 7
+
+        # --- Stage 8: pickup the target object ---
+        if stage <= 8:
             if target_color and target_type:
                 label = f"pickup the {target_color} {target_type}"
             elif target_type:
                 label = f"pickup the {target_type}"
             else:
                 label = "pickup the target"
-            return label, 5
+            return label, 8
 
         # All stages exhausted — keep the final subgoal visible to the
         # agent's text stream while the training loop's
@@ -492,9 +551,9 @@ if __name__ == "__main__":
 
     test_envs = [
         ("MiniGrid-DoorKey-5x5-v0", 5),
-        ("MiniGrid-GoToDoor-5x5-v0", 1),
-        ("MiniGrid-GoToObject-6x6-N2-v0", 1),
-        ("MiniGrid-UnlockPickup-v0", 6),
+        ("MiniGrid-GoToDoor-5x5-v0", 2),
+        ("MiniGrid-GoToObject-6x6-N2-v0", 2),
+        ("MiniGrid-UnlockPickup-v0", 9),
     ]
 
     print("=" * 70)
@@ -526,9 +585,10 @@ if __name__ == "__main__":
                 f"mission={mission!r} -> stage={new_stage} '{subgoal}'"
             )
 
-            # Invariants: no forbidden prefixes
+            # Invariants: no forbidden prefixes ("go near" is allowed,
+            # "go to " is not).
             assert "explore" not in subgoal.lower()
-            assert not subgoal.lower().startswith("go to")
+            assert not subgoal.lower().startswith("go to ")
 
         # Stage advancement test — drive through every stage
         print(f"  Stage advancement (seed=0):")

@@ -86,7 +86,7 @@ from utils.subgoal_logger import SubgoalLogger
 DEFAULT_ENV = LEGACY_DEFAULT_ENV
 NUM_ENVS = 16
 NUM_FRAMES_PER_PROC = 128
-TOTAL_FRAMES = 20_000_000
+TOTAL_FRAMES = 50_000_000
 
 # PPO hyperparameters from LGRL paper (Section 4.3)
 LR = 1e-4

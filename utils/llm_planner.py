@@ -56,7 +56,14 @@ Mission: pick up the green ball
 Direction: south
 Environment: {"inventory": "purple key", "boundaries": {"forward": "1 step", "left": "unknown", "right": "unknown"}, "entities": [{"entity": "locked purple door", "location": "1 step forward"}]}
 Past Subgoals: pickup the purple key
-Output: Subgoal: open the locked purple door<end>"""
+Output: Subgoal: open the locked purple door<end>
+
+--- Example 4: Drop Key Before Pickup ---
+Mission: pick up the green ball
+Direction: south
+Environment: {"inventory": "purple key", "boundaries": {"forward": "2 steps", "left": "1 step", "right": "unknown"}, "entities": [{"entity": "open purple door", "location": "1 step behind"}, {"entity": "green ball", "location": "2 steps forward"}]}
+Past Subgoals: pickup the purple key, open the locked purple door
+Output: Subgoal: drop the purple key<end>"""
 
 IDX_TO_DIRECTION = {0: "east", 1: "south", 2: "west", 3: "north"}
 

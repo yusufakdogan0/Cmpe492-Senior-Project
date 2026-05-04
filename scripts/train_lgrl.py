@@ -5,9 +5,9 @@ Supports both LLM (Qwen 2.5 7B) and rule-based oracle planners.
 
 Supported environments:
   - MiniGrid-DoorKey-5x5-v0              (5 stages)
-  - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0   (1 stage)
-  - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (1 stage)
-  - MiniGrid-UnlockPickup-v0             (6 stages)
+  - MiniGrid-GoToDoor-{5x5,6x6,8x8}-v0   (2 stages)
+  - MiniGrid-GoToObject-{6x6,8x8}-N2-v0  (2 stages)
+  - MiniGrid-UnlockPickup-v0             (10 stages)
 
 Two training modes:
   - Single-env (--env): all 16 worker envs run the same task. Backward

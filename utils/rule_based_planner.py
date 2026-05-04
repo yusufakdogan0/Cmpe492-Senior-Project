@@ -23,16 +23,17 @@ Supported environments:
     Stage 1 — go near the [color] [object]     (agent adjacent to target)
               where [object] is one of {key, ball, box}
 
-  UnlockPickup-* (9 stages)
+  UnlockPickup-* (10 stages)
     Stage 0 — search for the [key_color] key       (skipped if visible/carried)
     Stage 1 — go near the [key_color] key          (skipped if already carried)
     Stage 2 — pickup the [key_color] key           (skipped if already carried)
     Stage 3 — search for the [door_color] door     (skipped if door visible)
     Stage 4 — go near the [door_color] door        (skipped if door already open)
     Stage 5 — open the locked [door_color] door    (skipped if door open)
-    Stage 6 — search for the [target_color] [obj]  (skipped if target visible)
-    Stage 7 — go near the [target_color] [obj]     (skipped if target carried)
-    Stage 8 — pickup the [target_color] [obj]
+    Stage 6 — drop the [key_color] key             (skipped if not carrying key)
+    Stage 7 — search for the [target_color] [obj]  (skipped if target visible)
+    Stage 8 — go near the [target_color] [obj]     (skipped if target carried)
+    Stage 9 — pickup the [target_color] [obj]
 
     Note: the key/door color is inferred from the observation (it is NOT in
     the mission text). The target color and object type come from the
@@ -52,7 +53,7 @@ KNOWN_OBJECTS = {"key", "ball", "box", "door", "goal"}
 # Per-mission-family stage counts (paper Eq. 6 n)
 DOORKEY_STAGES = 5
 GOTO_STAGES = 2
-UNLOCKPICKUP_STAGES = 9
+UNLOCKPICKUP_STAGES = 10
 
 
 class RuleBasedPlanner:
@@ -307,7 +308,7 @@ class RuleBasedPlanner:
     def _unlockpickup_stages(
         self, stage: int, mission: str, inventory: str, entities: list[dict]
     ) -> tuple[str, int]:
-        """Nine-stage planner for UnlockPickup.
+        """Ten-stage planner for UnlockPickup.
 
         Mission: "pick up the <target_color> <target_object>"
         (target_object is typically "box" in MiniGrid-UnlockPickup-v0).
@@ -319,16 +320,23 @@ class RuleBasedPlanner:
           3 — search for the <door_color> door     (skip if door visible)
           4 — go near the <door_color> door        (skip if door already open)
           5 — open the locked <door_color> door    (skip if door already open)
-          6 — search for the <target_color> <target_object>
+          6 — drop the <key_color> key             (skip if not carrying key)
+          7 — search for the <target_color> <target_object>
                                                    (skip if target visible/carried)
-          7 — go near the <target_color> <target_object>
+          8 — go near the <target_color> <target_object>
                                                    (skip if target carried)
-          8 — pickup the <target_color> <target_object>
+          9 — pickup the <target_color> <target_object>
 
         Color handling: the key/door color is inferred from the observation
         (a visible key, or a visible door) — it is NOT in the mission text.
         The target color and object type come from the mission. The two
         colors typically differ (e.g. yellow key + purple box).
+
+        The explicit drop stage at index 6 teaches the policy to release the
+        key after opening the door so its inventory is empty in time for the
+        target pickup at stage 9 (MiniGrid's pickup action requires an empty
+        inventory). Without this, agents that successfully open the door
+        often time out pressing pickup with the key still in hand.
 
         Forward-only invariant: returned stage >= input stage.
         """
@@ -427,6 +435,9 @@ class RuleBasedPlanner:
         # --- Stage 5: open the locked door ---
         if stage <= 5:
             if open_doors:
+                # Door already open — drop stage still applies (we may
+                # still be carrying the key), so the cascade continues
+                # at stage 6 which itself skips forward if not carrying.
                 return self._unlockpickup_stages(6, mission, inventory, entities)
             color = door_color or key_color
             label = (
@@ -435,41 +446,51 @@ class RuleBasedPlanner:
             )
             return label, 5
 
-        # --- Stage 6: search for the target object ---
+        # --- Stage 6: drop the key ---
         if stage <= 6:
-            if carrying_target:
-                return self._unlockpickup_stages(8, mission, inventory, entities)
-            if target_visible:
+            if not carrying_key:
+                # Key already released (or lost mid-navigation) — nothing
+                # to drop; skip ahead to the target-search stage.
                 return self._unlockpickup_stages(7, mission, inventory, entities)
+            color = key_color or door_color
+            label = f"drop the {color} key" if color else "drop the key"
+            return label, 6
+
+        # --- Stage 7: search for the target object ---
+        if stage <= 7:
+            if carrying_target:
+                return self._unlockpickup_stages(9, mission, inventory, entities)
+            if target_visible:
+                return self._unlockpickup_stages(8, mission, inventory, entities)
             if target_color and target_type:
                 label = f"search for the {target_color} {target_type}"
             elif target_type:
                 label = f"search for the {target_type}"
             else:
                 label = "search for the target"
-            return label, 6
+            return label, 7
 
-        # --- Stage 7: go near the target object ---
-        if stage <= 7:
+        # --- Stage 8: go near the target object ---
+        if stage <= 8:
             if carrying_target:
-                return self._unlockpickup_stages(8, mission, inventory, entities)
+                return self._unlockpickup_stages(9, mission, inventory, entities)
             if target_color and target_type:
                 label = f"go near the {target_color} {target_type}"
             elif target_type:
                 label = f"go near the {target_type}"
             else:
                 label = "go near the target"
-            return label, 7
+            return label, 8
 
-        # --- Stage 8: pickup the target object ---
-        if stage <= 8:
+        # --- Stage 9: pickup the target object ---
+        if stage <= 9:
             if target_color and target_type:
                 label = f"pickup the {target_color} {target_type}"
             elif target_type:
                 label = f"pickup the {target_type}"
             else:
                 label = "pickup the target"
-            return label, 8
+            return label, 9
 
         # All stages exhausted — keep the final subgoal visible to the
         # agent's text stream while the training loop's
@@ -553,7 +574,7 @@ if __name__ == "__main__":
         ("MiniGrid-DoorKey-5x5-v0", 5),
         ("MiniGrid-GoToDoor-5x5-v0", 2),
         ("MiniGrid-GoToObject-6x6-N2-v0", 2),
-        ("MiniGrid-UnlockPickup-v0", 9),
+        ("MiniGrid-UnlockPickup-v0", 10),
     ]
 
     print("=" * 70)

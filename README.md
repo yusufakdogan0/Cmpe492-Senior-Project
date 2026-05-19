@@ -21,7 +21,8 @@ Official project documentation, timeline, and milestones are in the [Repository 
 ├── scripts/
 │   ├── train_baseline.py       # Baseline PPO training (no subgoal guidance)
 │   ├── train_lgrl.py           # LGRL training (LLM planner by default)
-│   └── train_lgrl_rule.py      # LGRL rule oracle (standalone script)
+│   ├── train_lgrl_rule.py      # LGRL rule oracle (standalone script)
+│   └── eval_lgrl.py            # Evaluate checkpoints (5-env suite)
 ├── utils/
 │   ├── __init__.py
 │   ├── env_parser.py           # MiniGrid 7x7 observation -> JSON for the LLM
@@ -30,7 +31,9 @@ Official project documentation, timeline, and milestones are in the [Repository 
 │   ├── rule_based_planner.py   # Stage-based deterministic oracle planner
 │   ├── subgoal_tracker.py      # Subgoal completion verification
 │   ├── subgoal_logger.py       # Per-environment JSONL subgoal logging
-│   └── sequential_env.py       # Single-process env stepper for torch-ac
+│   ├── sequential_env.py       # Single-process env stepper for torch-ac
+│   ├── eval_config.py          # Five-env evaluation suite configuration
+│   └── checkpoint_utils.py     # Checkpoint load / metadata helpers
 ├── checkpoints/                # Saved model weights (git-ignored)
 ├── logs/                       # Metrics CSV, plots & subgoal logs (git-ignored)
 ├── requirements.txt
@@ -321,6 +324,177 @@ When `--subgoal-log` is enabled, per-environment JSONL files are written under `
 | `episode_end` | Episode terminates                         | `success`, `episode_steps`          |
 
 Each line includes a timestamp and episode counter for grouping.
+
+## Checkpoints
+
+Training scripts write PyTorch checkpoints under `checkpoints/` (git-ignored). All LGRL trainers save the same fields:
+
+| Field | Description |
+|-------|-------------|
+| `model_state_dict` | `LGRLAgent` or `BaselineAgent` weights (required for eval) |
+| `vocab` | `word2idx` dict for mission/subgoal tokenization (required for eval) |
+| `optimizer_state_dict` | PPO optimizer (eval ignores this) |
+| `update`, `total_frames` | Training progress |
+| `planner` | `rule_based` or `llm` (train-time planner tag) |
+| `env` | Training env id, or `null` in mix mode |
+| `mix` | Mix spec string, or `null` in single-env mode |
+
+| Script | Default checkpoint path |
+|--------|-------------------------|
+| `train_lgrl_rule.py` | `checkpoints/lgrl_rule.pt` (DoorKey-5x5) |
+| `train_lgrl.py` | `checkpoints/lgrl.pt` |
+| `train_baseline.py` | `checkpoints/baseline.pt` |
+
+Other envs use tagged names, e.g. `checkpoints/lgrl_rule_unlockpickup.pt`.
+
+## Evaluation
+
+`scripts/eval_lgrl.py` loads a trained checkpoint and measures performance over many episodes. It reports **success rate**, **average return** (raw MiniGrid reward), **average steps**, and **mean policy entropy** per environment, and writes detailed JSONL traces for debugging.
+
+**Intended workflow (LGRL paper style):** train with the **rule-based** oracle (`train_lgrl_rule.py`), then evaluate with the **LLM** planner so subgoals at test time come from Ollama. You can also evaluate with `--planner rule_based` (no Ollama) or run a **baseline** checkpoint with `--agent baseline`.
+
+Benchmark environments are defined in `utils/eval_config.py`:
+
+| Key | Environment | Notes |
+|-----|-------------|--------|
+| `gotodoor` | `MiniGrid-GoToDoor-5x5-v0` | Navigate to door, `done` |
+| `gotoobject` | `MiniGrid-GoToObject-6x6-N2-v0` | Navigate to object, `done` |
+| `doorkey5x5` | `MiniGrid-DoorKey-5x5-v0` | Key → door → goal |
+| `unlockpickup` | `MiniGrid-UnlockPickup-v0` | Key, unlock, pickup target |
+| `keycorridor` | `MiniGrid-KeyCorridor-S3R3-v0` | Multi-room key corridor |
+
+### Ollama setup (for `--planner llm`)
+
+Use **two terminals**: one keeps Ollama running; the other runs Python.
+
+**Terminal 1 — Ollama server**
+
+```bash
+# Install from https://ollama.com/download if needed, then:
+ollama pull qwen2.5:7b
+ollama serve
+```
+
+Leave this running. The API listens at `http://127.0.0.1:11434` (shown in the server log).
+
+**Terminal 2 — project venv**
+
+```bash
+cd Cmpe492-Senior-Project
+venv\Scripts\activate          # Windows
+# source venv/bin/activate     # macOS / Linux
+
+# Optional: verify the planner talks to Ollama (loads model once)
+python utils/llm_planner.py
+```
+
+On **CPU-only** machines, each subgoal call can take tens of seconds. The eval script defaults to a **120s HTTP timeout**, **compact prompt**, and a **warmup** request before the benchmark loop. If you still see timeouts, pass `--llm-timeout 180`.
+
+### How to run evaluation
+
+1. Train (or locate) a checkpoint under `checkpoints/`, e.g. `lgrl_rule.pt` or `lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3.pt`.
+2. Start `ollama serve` and ensure the model is pulled.
+3. Run `eval_lgrl.py` with `--checkpoint` and `--planner llm`.
+
+**Example 1 — Quick smoke test (10 episodes, one env)**
+
+```bash
+python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt ^
+    --planner llm --episodes 10 --envs doorkey5x5
+```
+
+(PowerShell: use backtick `` ` `` instead of `^` for line continuation.)
+
+**Example 2 — UnlockPickup only (mixed-training checkpoint, 100 episodes)**
+
+```bash
+python scripts/eval_lgrl.py ^
+    --checkpoint checkpoints/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3.pt ^
+    --planner llm --episodes 100 --envs unlockpickup
+```
+
+**Example 3 — Full five-environment suite (paper-style, 1000 episodes each)**
+
+```bash
+python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt --planner llm
+```
+
+This can take a long time on CPU because every subgoal advance calls Ollama. Reduce `--episodes` while iterating.
+
+**Example 4 — Rule-based eval (no Ollama)**
+
+Useful to measure the policy alone, with the same oracle used in training:
+
+```bash
+python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt ^
+    --planner rule_based --episodes 200 --envs unlockpickup,gotodoor
+```
+
+**Example 5 — Baseline agent**
+
+```bash
+python scripts/eval_lgrl.py --checkpoint checkpoints/baseline.pt ^
+    --agent baseline --episodes 500 --envs doorkey5x5
+```
+
+**Example 6 — Subset of envs with custom output folder**
+
+```bash
+python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt ^
+    --planner llm --episodes 50 --envs gotodoor,gotoobject ^
+    --run-name ablation_50ep --llm-timeout 180
+```
+
+### CLI reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--checkpoint` | (required) | Path to `.pt` from training |
+| `--planner` | `llm` | `llm` (Ollama) or `rule_based` |
+| `--agent` | `lgrl` | `lgrl` (`LGRLAgent`) or `baseline` |
+| `--llm-model` | `qwen2.5:7b` | Ollama model tag |
+| `--ollama-host` | `http://127.0.0.1:11434` | Ollama base URL |
+| `--episodes` | `1000` | Episodes **per** environment |
+| `--envs` | all five keys | Comma-separated subset (see table above) |
+| `--seed-start` | `0` | Episode `i` uses seed `seed_start + i` |
+| `--deterministic` | on | Greedy actions; `--no-deterministic` to sample |
+| `--llm-timeout` | `120` | Seconds per Ollama HTTP request |
+| `--warmup` | on | Pre-load model before eval; `--no-warmup` to skip |
+| `--llm-fewshot` | off | Long few-shot prompt (slower than compact default) |
+| `--output-dir` | auto | Override output directory |
+| `--run-name` | none | Suffix on auto-generated run folder name |
+| `--device` | auto | `cuda` or `cpu` |
+
+### Output files
+
+Results are written under `logs/eval/<checkpoint_stem>_<timestamp>/` (or `--output-dir`):
+
+| File | Contents |
+|------|----------|
+| `config.json` | Run settings + checkpoint metadata |
+| `summary.csv` | Per-env table: success rate, avg return, avg steps, mean entropy |
+| `summary.json` | Same aggregates as JSON |
+| `episodes_<key>.jsonl` | One JSON line per episode: mission, success, steps, `subgoal_trace`, raw LLM text |
+
+Console prints a one-line summary per environment when the run finishes.
+
+### Metrics
+
+| Metric | Meaning |
+|--------|---------|
+| **success_rate** | Fraction of episodes with **positive total env reward** (task completed) |
+| **avg_return** | Mean **raw** MiniGrid reward per episode (not LGRL shaped reward) |
+| **avg_steps** | Mean episode length in environment steps |
+| **mean_entropy** | Mean policy entropy over steps (exploration/stochasticity of actions) |
+
+### Troubleshooting
+
+| Issue | What to do |
+|-------|------------|
+| `Ollama timed out` / HTTP 500 in Ollama logs | Increase `--llm-timeout`; keep `ollama serve` running; first request loads the model (~10s+ on CPU) |
+| `parse fallback` in logs | LLM output was not parsed; fallback subgoal `search for the key` is used. Check `episodes_*.jsonl` → `raw_llm` / `subgoal_trace` |
+| `Cannot create env ... KeyCorridor` | MiniGrid version may use a different env id; edit `utils/eval_config.py` |
+| Eval very slow | Lower `--episodes`, use `--envs` for one task, or `--planner rule_based` |
 
 ## Tech Stack
 

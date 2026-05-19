@@ -503,6 +503,86 @@ class RuleBasedPlanner:
             label = "pickup the target"
         return label, UNLOCKPICKUP_STAGES
 
+    # -- UnlockPickup stage machine -------------------------------------
+
+    def _unlockpickup_stages(
+        self, stage: int, mission: str, inventory: str, entities: list[dict]
+    ) -> tuple[str, int]:
+        """Walk the UnlockPickup stage machine.
+
+        Mission: "pick up the <color> <object>"
+        6 stages, forward-only. Search stages (0, 2, 4) skip forward when
+        the target is already visible; action stages (1, 3, 5) always emit
+        since forward-only guarantees their preconditions hold.
+        """
+
+        # Parse target from mission ("pick up the <color> <object>")
+        target_color = _mission_color(mission)
+        target_type = _mission_object(mission)
+
+        keys = _find_entities(entities, obj_type="key")
+        locked_doors = _find_entities(entities, obj_type="door", status="locked")
+        all_doors = _find_entities(entities, obj_type="door")
+
+        # Infer key/door color from any visible key or door
+        key_color = ""
+        if keys:
+            key_color = _entity_color(keys[0])
+        elif all_doors:
+            key_color = _entity_color(all_doors[0])
+        door_color = key_color
+        if all_doors:
+            door_color = _entity_color(all_doors[0])
+
+        # --- Stage 0: search for key ---
+        if stage <= 0:
+            if keys:
+                # Key already visible — skip to pickup
+                return self._unlockpickup_stages(1, mission, inventory, entities)
+            color = key_color or door_color
+            label = f"search for the {color} key" if color else "search for the key"
+            return label, 0
+
+        # --- Stage 1: pickup the key ---
+        if stage <= 1:
+            color = key_color or door_color
+            label = f"pickup the {color} key" if color else "pickup the key"
+            return label, 1
+
+        # --- Stage 2: search for locked door ---
+        if stage <= 2:
+            if locked_doors:
+                # Door already visible — skip to open
+                return self._unlockpickup_stages(3, mission, inventory, entities)
+            color = door_color or key_color
+            label = f"search for the {color} door" if color else "search for the door"
+            return label, 2
+
+        # --- Stage 3: open the locked door ---
+        if stage <= 3:
+            color = door_color or key_color
+            label = f"open the locked {color} door" if color else "open the locked door"
+            return label, 3
+
+        # --- Stage 4: search for the target object ---
+        if stage <= 4:
+            targets = _find_entities(
+                entities, obj_type=target_type, color=target_color
+            )
+            if targets:
+                # Target already visible — skip to pickup
+                return self._unlockpickup_stages(5, mission, inventory, entities)
+            label = f"search for the {target_color} {target_type}"
+            return label, 4
+
+        # --- Stage 5: pickup the target object ---
+        if stage <= 5:
+            label = f"pickup the {target_color} {target_type}"
+            return label, 5
+
+        # All stages exhausted
+        return f"pickup the {target_color} {target_type}", UNLOCKPICKUP_STAGES
+
 
 # -- helper functions (module-level) -----------------------------------
 

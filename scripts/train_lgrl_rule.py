@@ -28,6 +28,7 @@ Artifact naming:
 
 Usage:
     python scripts/train_lgrl_rule.py
+    python scripts/train_lgrl_rule.py --env MiniGrid-UnlockPickup-v0
     python scripts/train_lgrl_rule.py --env MiniGrid-GoToDoor-5x5-v0
     python scripts/train_lgrl_rule.py --env MiniGrid-UnlockPickup-v0
     python scripts/train_lgrl_rule.py \\

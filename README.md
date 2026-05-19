@@ -59,13 +59,16 @@ All three training scripts accept `--env <env_id>`. Supported environments mirro
 | Env ID                              | Mission template                                        | Stages | `T_max` (from `env.max_steps`) |
 |-------------------------------------|---------------------------------------------------------|:------:|:------------------------------:|
 | `MiniGrid-DoorKey-5x5-v0` (default) | `use the key to open the door and then get to the goal` | 5      | 250                            |
-| `MiniGrid-GoToDoor-5x5-v0`          | `go to the <color> door`                                | 1      | 100                            |
-| `MiniGrid-GoToDoor-6x6-v0`          | `go to the <color> door`                                | 1      | 144                            |
-| `MiniGrid-GoToDoor-8x8-v0`          | `go to the <color> door`                                | 1      | 256                            |
-| `MiniGrid-GoToObject-6x6-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 1      | 180                            |
-| `MiniGrid-GoToObject-8x8-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 1      | 320                            |
+| `MiniGrid-GoToDoor-5x5-v0`          | `go to the <color> door`                                | 2      | 100                            |
+| `MiniGrid-GoToDoor-6x6-v0`          | `go to the <color> door`                                | 2      | 144                            |
+| `MiniGrid-GoToDoor-8x8-v0`          | `go to the <color> door`                                | 2      | 256                            |
+| `MiniGrid-GoToObject-6x6-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 2      | 180                            |
+| `MiniGrid-GoToObject-8x8-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 2      | 320                            |
+| `MiniGrid-UnlockPickup-v0`          | `pick up the <color> box`                               | 10     | 288                            |
 
 The `GoToDoor` and `GoToObject` families end when the agent issues the `done` action (MiniGrid action 6) while adjacent to the correct target; reaching that state gives the positive environment reward that triggers our mission-level reward (Eq. 5).
+
+The `UnlockPickup` family ends when the agent picks up the target object in the locked room. It is the only family in this codebase where the mission text mentions a *target* color while the **key/door color is different and inferred from observation**.
 
 Mission-family detection is done from the mission string, not the env name, so custom envs using the same mission templates will also work.
 
@@ -81,6 +84,7 @@ The env tag is the env id with `MiniGrid-` and `-v0` stripped, hyphens removed, 
 ```
 MiniGrid-GoToDoor-5x5-v0       -> gotodoor5x5
 MiniGrid-GoToObject-6x6-N2-v0  -> gotoobject6x6n2
+MiniGrid-UnlockPickup-v0       -> unlockpickup
 ```
 
 ## Training
@@ -93,6 +97,7 @@ Standard PPO agent conditioned only on the mission string. Used as the control c
 python scripts/train_baseline.py                                  # DoorKey-5x5 (default)
 python scripts/train_baseline.py --env MiniGrid-GoToDoor-5x5-v0
 python scripts/train_baseline.py --env MiniGrid-GoToObject-6x6-N2-v0
+python scripts/train_baseline.py --env MiniGrid-UnlockPickup-v0
 python scripts/train_baseline.py --resume                         # resume matching checkpoint
 ```
 
@@ -114,6 +119,7 @@ The LLM (Qwen 2.5 7B via Ollama) generates subgoals at each decision point durin
 python scripts/train_lgrl.py                                        # DoorKey-5x5, LLM planner
 python scripts/train_lgrl.py --env MiniGrid-GoToDoor-5x5-v0
 python scripts/train_lgrl.py --env MiniGrid-GoToObject-6x6-N2-v0
+python scripts/train_lgrl.py --env MiniGrid-UnlockPickup-v0
 python scripts/train_lgrl.py --subgoal-log                          # enable per-env subgoal logging
 python scripts/train_lgrl.py --planner rule_based                   # oracle ablation via same script
 python scripts/train_lgrl.py --resume                               # resume from checkpoint
@@ -138,6 +144,7 @@ A stage-based deterministic planner that produces the same subgoal format as the
 python scripts/train_lgrl_rule.py                                     # DoorKey-5x5
 python scripts/train_lgrl_rule.py --env MiniGrid-GoToDoor-5x5-v0
 python scripts/train_lgrl_rule.py --env MiniGrid-GoToObject-6x6-N2-v0
+python scripts/train_lgrl_rule.py --env MiniGrid-UnlockPickup-v0
 python scripts/train_lgrl_rule.py --subgoal-log                       # enable per-env subgoal logging
 python scripts/train_lgrl_rule.py --resume                            # resume from checkpoint
 ```
@@ -155,6 +162,40 @@ Artifacts for DoorKey-5x5:
 
 For any other env, swap `lgrl_rule` → `lgrl_rule_<envtag>`.
 
+### Mixed-task training (paper §4.5)
+
+The paper does **not** train UnlockPickup standalone from scratch. The reward is too sparse for random exploration to bootstrap (a uniform-random policy effectively never solves an episode within `T_max`, so PPO has no learning signal). Two setups are reported instead:
+
+- §4.4 (Table 2): UnlockPickup is tested as **zero-shot transfer** from a KeyCorridor-trained agent.
+- §4.5 (single-step convergence, Fig. 3): UnlockPickup is trained **mixed** with `GoToObject` at a 1:3 ratio. The easy task gives the agent dense reward signal for navigation while it learns the harder task.
+
+`--mix` is mutually exclusive with `--env`. Format: `env1:r1,env2:r2`. The total ratio must divide `NUM_ENVS=16` evenly. With ratio 1:3 you get 4 UnlockPickup + 12 GoToObject worker envs. All three training scripts support it identically:
+
+```bash
+python scripts/train_lgrl_rule.py \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+
+python scripts/train_lgrl.py --planner llm \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+
+python scripts/train_baseline.py \
+    --mix "MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3"
+```
+
+In mix mode, the per-update stdout breakdown shows each family's episode count, return, steps, and success rate independently. The CSV gains four columns per family — `<fam>_episodes`, `<fam>_avg_return`, `<fam>_avg_steps`, `<fam>_success_rate` — so UnlockPickup convergence can be tracked without being washed out by the much-easier GoToObject episodes that dominate the global average. The plot panels for return and steps overlay per-family curves on the global curve.
+
+Mix-mode artifacts:
+
+| Artifact     | Path                                                                       |
+|--------------|----------------------------------------------------------------------------|
+| Metrics CSV  | `logs/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3_metrics.csv`         |
+| Checkpoint   | `checkpoints/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3.pt`           |
+| Plot         | `logs/plots/lgrl_rule_mix_unlockpickup_gotoobject6x6n2_1to3_training_curves.png` |
+
+Stem format: `<base>_mix_<env1tag>_<env2tag>_<r1>to<r2>`. Different mixes get distinct artifact paths so multiple ratio experiments don't clobber each other. Resume validates that the saved mix spec matches the requested one.
+
+Single-env runs (`--env`) keep their original CSV format and artifact paths byte-for-byte; mix-mode CSV is a strict superset.
+
 ## Architecture
 
 The agent operates in a bi-level hierarchy:
@@ -169,6 +210,7 @@ Only these subgoal forms are used:
 | Subgoal | Format                             | Example                    |
 |---------|------------------------------------|----------------------------|
 | Search  | `search for the [color] [object]`  | `search for the blue door` |
+| Go near | `go near the [color] [object]`     | `go near the blue key`     |
 | Pickup  | `pickup the [color] [object]`      | `pickup the yellow key`    |
 | Open    | `open the [status] [color] door`   | `open the locked yellow door` |
 | Close   | `close the [status] [color] door`  | `close the open yellow door` |
@@ -188,21 +230,42 @@ The rule-based planner dispatches on the mission string. The forward-only stage 
 | 3     | `open the locked [color] door` | Door already open → jump to stage 4         |
 | 4     | `search for the goal`          | —                                           |
 
-#### GoToDoor (1 stage)
+#### GoToDoor (2 stages)
 
-| Stage | Subgoal                        |
-|:-----:|--------------------------------|
-| 0     | `search for the [color] door`  |
+| Stage | Subgoal                        | Skipped if…                                 |
+|:-----:|--------------------------------|---------------------------------------------|
+| 0     | `search for the [color] door`  | Door already visible → jump to stage 1      |
+| 1     | `go near the [color] door`     | —                                           |
 
-The mission-completion reward (Eq. 5) is granted when the agent issues `done` next to the correct door.
+The mission-completion reward (Eq. 5) is granted when the agent issues `done` next to the correct door. The `go near` subgoal rewards the agent for becoming cardinally adjacent to the door before that final `done`.
 
-#### GoToObject (1 stage)
+#### GoToObject (2 stages)
 
-| Stage | Subgoal                                    |
-|:-----:|--------------------------------------------|
-| 0     | `search for the [color] [key\|ball\|box]`  |
+| Stage | Subgoal                                    | Skipped if…                                    |
+|:-----:|--------------------------------------------|------------------------------------------------|
+| 0     | `search for the [color] [key\|ball\|box]`  | Object already visible → jump to stage 1       |
+| 1     | `go near the [color] [key\|ball\|box]`     | —                                              |
 
 Same pattern as GoToDoor — the mission terminates on `done` next to the correct object.
+
+#### UnlockPickup (10 stages)
+
+The only family where the mission text mentions a target color while the **key/door color is different and inferred from observation** (a visible key in the starting room, or a visible door if the key is hidden). Each `go near` stage rewards adjacency, then the next stage rewards the actual interaction (pickup or open). Stage 6 is an explicit `drop` of the room key — MiniGrid's `pickup` action requires an empty inventory, so without this stage successful door-opening trajectories often time out at stage 9 with the key still in hand.
+
+| Stage | Subgoal                                          | Skipped if…                                              |
+|:-----:|--------------------------------------------------|----------------------------------------------------------|
+| 0     | `search for the [key_color] key`                 | Key visible → jump to 1; carrying key → jump to 3        |
+| 1     | `go near the [key_color] key`                    | Already carrying key → jump to stage 3                   |
+| 2     | `pickup the [key_color] key`                     | Already carrying key → jump to stage 3                   |
+| 3     | `search for the [door_color] door`               | Locked door visible → jump to 4; open door visible → 6   |
+| 4     | `go near the [door_color] door`                  | Door already open → jump to stage 6                      |
+| 5     | `open the locked [door_color] door`              | Door already open → jump to stage 6                      |
+| 6     | `drop the [key_color] key`                       | Not carrying the key → jump to stage 7                   |
+| 7     | `search for the [target_color] [target_object]`  | Target visible → jump to 8; carrying target → jump to 9  |
+| 8     | `go near the [target_color] [target_object]`     | Carrying target → jump to stage 9                        |
+| 9     | `pickup the [target_color] [target_object]`      | —                                                        |
+
+The mission ends when the agent picks up the target — the env emits a positive reward at that moment, which triggers the mission-level reward (Eq. 5). With the explicit drop at stage 6 the inventory is empty by the time the agent reaches the target, so the stage-9 pickup is unblocked.
 
 ### Reward Scaffolding (LGRL paper Eqs. 5–7)
 
@@ -226,9 +289,9 @@ All reward-shaping parameters are defined at the top of `train_lgrl.py` and `tra
 | `R_SUBGOAL`            | `0.5`               | Max per-subgoal reward (`R_t`) before 1/N normalization         | See above                                                             |
 | `MISSION_TIME_COEF`    | `0.5`               | 0.5 factor in Eq. 5                                             | At 0.5 an agent finishing at `T_max` still gets `0.25 * R_MISSION`    |
 | `SUBGOAL_TIME_COEF`    | `0.5`               | 0.5 factor in Eq. 6                                             | Same shape as mission penalty                                         |
-| `T_max`                | `env.max_steps`     | Paper's `T_max`, derived from the env at startup                | Per-env: 250 / 100 / 144 / 256 / 180 / 320 (see table)                |
+| `T_max`                | `env.max_steps`     | Paper's `T_max`, derived from the env at startup                | Per-env: 250 / 100 / 144 / 256 / 180 / 320 / 288 (see table)          |
 | `SUBGOAL_TIMEOUT_MULT` | `2.0`               | Subgoal times out when `T_used > mult * T_i`                    | Also caps the ratio in the subgoal reward formula                     |
-| `N_SUBGOALS`           | derived from env    | Number of stages for this env family (5 / 1 / 1)                | Queried from `RuleBasedPlanner.num_stages(mission)` at startup         |
+| `N_SUBGOALS`           | derived from env    | Number of stages for this env family (5 / 2 / 2 / 10)           | Queried from `RuleBasedPlanner.num_stages(mission)` at startup         |
 
 ### PPO Hyperparameters (LGRL paper Section 4.3)
 

@@ -40,7 +40,11 @@ sys.path.insert(0, PROJECT_ROOT)
 
 from models.baseline_agent import BaselineAgent, Vocabulary
 from models.lgrl_agent import LGRLAgent
-from utils.checkpoint_utils import describe_checkpoint, load_checkpoint, load_vocab_from_checkpoint
+from utils.checkpoint_utils import (
+    describe_checkpoint,
+    load_checkpoint,
+    resolve_vocab,
+)
 from utils.env_parser import parse_env_description
 from utils.eval_config import (
     DEFAULT_NUM_EPISODES,
@@ -388,6 +392,14 @@ def parse_args():
     help="Path to .pt file (e.g. checkpoints/lgrl_rule.pt)",
   )
   p.add_argument(
+    "--vocab-checkpoint",
+    default=None,
+    help=(
+      "Optional separate .pt that contains 'vocab' (word2idx). "
+      "Use when evaluating run_experiment*.py checkpoints that omit vocab."
+    ),
+  )
+  p.add_argument(
     "--agent", choices=["lgrl", "baseline"], default="lgrl",
     help="Model architecture (default: lgrl). Auto-detected from checkpoint if omitted.",
   )
@@ -457,12 +469,25 @@ def main():
 
   ckpt_path = os.path.abspath(args.checkpoint)
   ckpt = load_checkpoint(ckpt_path, device)
-  vocab = load_vocab_from_checkpoint(ckpt)
+
+  env_keys = [k.strip() for k in args.envs.split(",")] if args.envs else None
+  suite = get_eval_suite(env_keys)
+  env_ids = [spec.env_id for spec in suite]
+
+  vocab, vocab_source = resolve_vocab(
+    ckpt,
+    env_ids=env_ids,
+    agent=args.agent,
+    device=device,
+    vocab_checkpoint_path=args.vocab_checkpoint,
+  )
 
   print("=" * 70)
   print("  LGRL Evaluation")
   print("=" * 70)
   print(describe_checkpoint(ckpt, ckpt_path))
+  print(f"  Vocab source   : {vocab_source}")
+  print(f"  Vocab size     : {len(vocab)}")
   print("=" * 70)
 
   train_planner = ckpt.get("planner")
@@ -472,9 +497,6 @@ def main():
     print(f"  Eval planner : LLM ({args.llm_model} @ {args.ollama_host})")
   elif args.agent == "lgrl":
     print("  Eval planner : rule_based oracle")
-
-  env_keys = [k.strip() for k in args.envs.split(",")] if args.envs else None
-  suite = get_eval_suite(env_keys)
 
   stem = os.path.splitext(os.path.basename(ckpt_path))[0]
   ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -537,7 +559,8 @@ def main():
     "episodes_per_env": args.episodes,
     "seed_start": args.seed_start,
     "deterministic": args.deterministic,
-    "device": str(device),
+    "vocab_source": vocab_source,
+    "vocab_size": len(vocab),
     "environments": [asdict(s) for s in suite],
     "checkpoint_meta": {
       "env": ckpt.get("env"),

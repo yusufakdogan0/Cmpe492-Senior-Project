@@ -463,6 +463,7 @@ python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt ^
 | `--llm-fewshot` | off | Long few-shot prompt (slower than compact default) |
 | `--output-dir` | auto | Override output directory |
 | `--run-name` | none | Suffix on auto-generated run folder name |
+| `--vocab-checkpoint` | none | Load `vocab` from another `.pt` if the model checkpoint omits it |
 | `--device` | auto | `cuda` or `cpu` |
 
 ### Output files
@@ -494,6 +495,7 @@ Console prints a one-line summary per environment when the run finishes.
 | `Ollama timed out` / HTTP 500 in Ollama logs | Increase `--llm-timeout`; keep `ollama serve` running; first request loads the model (~10s+ on CPU) |
 | `parse fallback` in logs | LLM output was not parsed; fallback subgoal `search for the key` is used. Check `episodes_*.jsonl` → `raw_llm` / `subgoal_trace` |
 | `Cannot create env ... KeyCorridor` | MiniGrid version may use a different env id; edit `utils/eval_config.py` |
+| `missing 'vocab'` on experiment checkpoint | Fixed automatically for older `checkpoints/experiment*/` files; or pass `--vocab-checkpoint checkpoints/lgrl_rule.pt` |
 | Eval very slow | Lower `--episodes`, use `--envs` for one task, or `--planner rule_based` |
 
 ## Tech Stack

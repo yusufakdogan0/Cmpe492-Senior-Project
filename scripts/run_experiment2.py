@@ -393,14 +393,18 @@ def run_condition(cond: dict, total_frames: int, log_root: str, ckpt_root: str):
 
         if update % CHECKPOINT_EVERY == 0:
             torch.save({"model_state_dict": model.state_dict(),
-                         "update": update, "total_frames": frames_done}, ckpt_path)
+                         "vocab": vocab.word2idx,
+                         "update": update, "total_frames": frames_done,
+                         "env": ENV_NAME}, ckpt_path)
 
         if update % PLOT_EVERY == 0:
             save_plots(history, plot_path, f"Exp2: {name}")
 
     # Final save
     torch.save({"model_state_dict": model.state_dict(),
-                 "update": update, "total_frames": frames_done}, ckpt_path)
+                 "vocab": vocab.word2idx,
+                 "update": update, "total_frames": frames_done,
+                 "env": ENV_NAME}, ckpt_path)
     csv_file.close()
     save_plots(history, plot_path, f"Exp2: {name}")
 

@@ -40,6 +40,20 @@ class Vocabulary:
     def __len__(self) -> int:
         return len(self.idx2word)
 
+    @classmethod
+    def load_from_dict(cls, word2idx: dict) -> "Vocabulary":
+        """Rebuild vocabulary from a checkpoint ``vocab`` field."""
+        vocab = cls()
+        vocab.word2idx = dict(word2idx)
+        if not vocab.word2idx:
+            return vocab
+        max_idx = max(vocab.word2idx.values())
+        vocab.idx2word = [cls.PAD_TOKEN] * (max_idx + 1)
+        for word, idx in vocab.word2idx.items():
+            if 0 <= idx < len(vocab.idx2word):
+                vocab.idx2word[idx] = word
+        return vocab
+
     def tokenize(self, mission: str, max_len: int = 16) -> list[int]:
         """Convert a mission string to a fixed-length list of token ids."""
         tokens = [self[w] for w in mission.lower().split()]

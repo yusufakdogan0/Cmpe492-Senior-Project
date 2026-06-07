@@ -187,13 +187,30 @@ def make_preprocess_obss(vocab, hierarchy_state, use_subgoal=True, device=None):
         images = torch.tensor(images, dtype=torch.float32, device=device)
         images = images.permute(0, 3, 1, 2) / 255.0
 
+        # During experience COLLECTION, torch_ac calls this with exactly
+        # num_envs observations (one per env, in env order), so
+        # active_subgoals[i] is the authoritative *current* subgoal for obs i.
+        # We STAMP it onto the obs dict. torch_ac stores that very dict
+        # (self.obss[i] = self.obs), so when it later re-preprocesses the
+        # flattened P*T rollout batch for the PPO update, each stored obs
+        # still carries the subgoal that was active when it was collected.
+        #
+        # Reading active_subgoals[i] positionally during the update is WRONG:
+        # there i ranges over P*T (=2048), not over envs, so every entry with
+        # i >= num_envs fell back to "collect wood" — i.e. ~99% of the update
+        # batch was conditioned on a constant subgoal, nullifying LGRL's text
+        # conditioning during every gradient step. Stamping fixes that:
+        # the per-timestep subgoal now flows into the PPO loss correctly.
+        collection_call = use_subgoal and (len(obss) == hierarchy_state.num_envs)
+
         token_ids = []
         for i, obs in enumerate(obss):
             if use_subgoal:
-                subgoal = (hierarchy_state.active_subgoals[i]
-                           if i < hierarchy_state.num_envs else "")
-                if not subgoal:
-                    subgoal = "collect wood"
+                if collection_call:
+                    subgoal = hierarchy_state.active_subgoals[i] or "collect wood"
+                    obs["subgoal"] = subgoal          # persists into stored obs
+                else:
+                    subgoal = obs.get("subgoal") or "collect wood"
                 combined = f"{obs['mission']} [SEP] {subgoal}"
             else:
                 combined = obs["mission"]

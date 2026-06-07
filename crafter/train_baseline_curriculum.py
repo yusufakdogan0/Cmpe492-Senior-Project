@@ -247,6 +247,13 @@ def parse_args():
     p.add_argument("--success-stability", default=DEFAULT_SUCCESS_STABILITY, type=int)
     p.add_argument("--max-frames-per-stage", default=DEFAULT_MAX_FRAMES_PER_STAGE, type=int)
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--init-from", default=None, type=str,
+                   help=("Warm-start the model + vocab + optimizer from this "
+                         "checkpoint, then run --curriculum from stage 0 under a "
+                         "NEW artifact stem. Unlike --resume, the saved curriculum "
+                         "need not match: use it to CONTINUE a trained agent into a "
+                         "deeper curriculum. Pair a baseline checkpoint with this "
+                         "(baseline) script and an LGRL checkpoint with the LGRL one."))
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -297,6 +304,20 @@ def main():
               "wood", "stone", "coal", "iron", "diamond", "pickaxe", "sword"):
         _ = vocab[s]
 
+    # ---- Optional warm-start: load checkpoint + restore its vocab ------
+    # Restoring the trained vocab before building the model keeps embedding
+    # token-ids aligned with the trained weights.
+    init_state = None
+    if args.init_from and not (args.resume and os.path.exists(checkpoint_path)):
+        if not os.path.exists(args.init_from):
+            raise SystemExit(f"--init-from checkpoint not found: {args.init_from}")
+        init_state = torch.load(args.init_from, map_location=DEVICE, weights_only=False)
+        if "vocab" in init_state:
+            vocab.word2idx = dict(init_state["vocab"])
+            vocab.idx2word = [None] * len(vocab.word2idx)
+            for w, idx in vocab.word2idx.items():
+                vocab.idx2word[idx] = w
+
     # Build a probe env just to get the obs/action spaces for the model.
     probe = CrafterTaskEnv(curriculum[0], seed=0)
     model = CrafterACModel(probe.observation_space, probe.action_space,
@@ -325,6 +346,17 @@ def main():
         history = _load_history_from_csv(csv_path, csv_fields)
         print(f"Resumed at stage {stage_idx} ({curriculum[stage_idx]}), "
               f"update {start_update}, {total_frames:,} frames.")
+    elif init_state is not None:
+        # Warm-start: carry trained weights + optimizer into a FRESH run of
+        # the given curriculum (counters/CSV/plots start clean under the new
+        # stem).
+        model.load_state_dict(init_state["model_state_dict"])
+        optimizer_state = init_state.get("optimizer_state_dict")
+        trained_on = init_state.get("curriculum", init_state.get("task", "?"))
+        print(f"Warm-started model + optimizer from {args.init_from}")
+        print(f"  (that checkpoint was trained on: {trained_on})")
+        print(f"  Starting curriculum {curriculum} from stage 0 under stem "
+              f"'{artifact_stem}'.")
 
     # ---- Build the first (or resumed) stage ---------------------------
     algo, envs, tracker, reshape, t_max = _build_algo_for_stage(

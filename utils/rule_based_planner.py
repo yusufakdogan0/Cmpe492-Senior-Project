@@ -23,7 +23,7 @@ Supported environments:
     Stage 1 — go near the [color] [object]     (agent adjacent to target)
               where [object] is one of {key, ball, box}
 
-  UnlockPickup-* (10 stages)
+  UnlockPickup-* / KeyCorridor-* (10 stages)
     Stage 0 — search for the [key_color] key       (skipped if visible/carried)
     Stage 1 — go near the [key_color] key          (skipped if already carried)
     Stage 2 — pickup the [key_color] key           (skipped if already carried)
@@ -38,6 +38,15 @@ Supported environments:
     Note: the key/door color is inferred from the observation (it is NOT in
     the mission text). The target color and object type come from the
     mission "pick up the [color] [object]". The two colors typically differ.
+
+    KeyCorridor uses the same mission template as UnlockPickup
+    ("pick up the [color] [obj]") and the same overall structure (find a
+    key, open the only locked door, retrieve the target), so it shares
+    this stage machine. KeyCorridor differs in that several unlocked
+    doors of varying colors are visible at the start — the key's color
+    matches the SINGLE locked door, not the first visible door — so
+    color inference prefers ``locked_doors`` before falling back to other
+    visible doors.
 
 In all cases the stage index only advances forward, preventing the agent
 from farming rewards by repeating earlier subgoals.
@@ -364,23 +373,36 @@ class RuleBasedPlanner:
             entities, obj_type=target_type, color=target_color or None
         )) if target_type else False
 
-        # Infer the key color (key matches door in UnlockPickup).
-        # If a key is visible we use that; else if a door is visible
-        # we copy its color; else if we're carrying the key, parse the
-        # inventory string.
+        # ---- Key / door color inference --------------------------------
+        # In UnlockPickup and KeyCorridor the (single) key's color matches
+        # the (single) locked door's color. We prefer the locked door for
+        # inference because KeyCorridor surfaces several unlocked doors of
+        # different colors at the start of an episode — picking the first
+        # visible door (as old code did) would be wrong in those cases.
+        # Resolution order:
+        #   1. locked door (most authoritative — matches the key by design)
+        #   2. visible key
+        #   3. inventory (after pickup)
+        #   4. open door (the now-opened locked door, key/door color match)
+        #   5. any visible door (last-resort fallback; UnlockPickup-safe
+        #      because only one door is ever visible in that env family)
         key_color = ""
-        if keys:
+        door_color = ""
+        if locked_doors:
+            door_color = _entity_color(locked_doors[0])
+            key_color = door_color
+        elif keys:
             key_color = _entity_color(keys[0])
-        elif all_doors:
-            key_color = _entity_color(all_doors[0])
+            door_color = key_color
         elif carrying_key:
             key_color = _extract_color(inv_words)
-
-        # Door color usually equals key color; prefer an actually-visible
-        # door's color when available.
-        door_color = key_color
-        if all_doors:
+            door_color = key_color
+        elif open_doors:
+            door_color = _entity_color(open_doors[0])
+            key_color = door_color
+        elif all_doors:
             door_color = _entity_color(all_doors[0])
+            key_color = door_color
 
         # --- Stage 0: search for the key ---
         if stage <= 0:
@@ -503,86 +525,6 @@ class RuleBasedPlanner:
             label = "pickup the target"
         return label, UNLOCKPICKUP_STAGES
 
-    # -- UnlockPickup stage machine -------------------------------------
-
-    def _unlockpickup_stages(
-        self, stage: int, mission: str, inventory: str, entities: list[dict]
-    ) -> tuple[str, int]:
-        """Walk the UnlockPickup stage machine.
-
-        Mission: "pick up the <color> <object>"
-        6 stages, forward-only. Search stages (0, 2, 4) skip forward when
-        the target is already visible; action stages (1, 3, 5) always emit
-        since forward-only guarantees their preconditions hold.
-        """
-
-        # Parse target from mission ("pick up the <color> <object>")
-        target_color = _mission_color(mission)
-        target_type = _mission_object(mission)
-
-        keys = _find_entities(entities, obj_type="key")
-        locked_doors = _find_entities(entities, obj_type="door", status="locked")
-        all_doors = _find_entities(entities, obj_type="door")
-
-        # Infer key/door color from any visible key or door
-        key_color = ""
-        if keys:
-            key_color = _entity_color(keys[0])
-        elif all_doors:
-            key_color = _entity_color(all_doors[0])
-        door_color = key_color
-        if all_doors:
-            door_color = _entity_color(all_doors[0])
-
-        # --- Stage 0: search for key ---
-        if stage <= 0:
-            if keys:
-                # Key already visible — skip to pickup
-                return self._unlockpickup_stages(1, mission, inventory, entities)
-            color = key_color or door_color
-            label = f"search for the {color} key" if color else "search for the key"
-            return label, 0
-
-        # --- Stage 1: pickup the key ---
-        if stage <= 1:
-            color = key_color or door_color
-            label = f"pickup the {color} key" if color else "pickup the key"
-            return label, 1
-
-        # --- Stage 2: search for locked door ---
-        if stage <= 2:
-            if locked_doors:
-                # Door already visible — skip to open
-                return self._unlockpickup_stages(3, mission, inventory, entities)
-            color = door_color or key_color
-            label = f"search for the {color} door" if color else "search for the door"
-            return label, 2
-
-        # --- Stage 3: open the locked door ---
-        if stage <= 3:
-            color = door_color or key_color
-            label = f"open the locked {color} door" if color else "open the locked door"
-            return label, 3
-
-        # --- Stage 4: search for the target object ---
-        if stage <= 4:
-            targets = _find_entities(
-                entities, obj_type=target_type, color=target_color
-            )
-            if targets:
-                # Target already visible — skip to pickup
-                return self._unlockpickup_stages(5, mission, inventory, entities)
-            label = f"search for the {target_color} {target_type}"
-            return label, 4
-
-        # --- Stage 5: pickup the target object ---
-        if stage <= 5:
-            label = f"pickup the {target_color} {target_type}"
-            return label, 5
-
-        # All stages exhausted
-        return f"pickup the {target_color} {target_type}", UNLOCKPICKUP_STAGES
-
 
 # -- helper functions (module-level) -----------------------------------
 
@@ -655,6 +597,15 @@ if __name__ == "__main__":
         ("MiniGrid-GoToDoor-5x5-v0", 2),
         ("MiniGrid-GoToObject-6x6-N2-v0", 2),
         ("MiniGrid-UnlockPickup-v0", 10),
+        # KeyCorridor uses the same mission template and same 10-stage
+        # machine as UnlockPickup. The smaller variants are the early
+        # curriculum stages used in train_lgrl_curriculum.py.
+        ("MiniGrid-KeyCorridorS3R1-v0", 10),
+        ("MiniGrid-KeyCorridorS3R2-v0", 10),
+        ("MiniGrid-KeyCorridorS3R3-v0", 10),
+        ("MiniGrid-KeyCorridorS4R3-v0", 10),
+        ("MiniGrid-KeyCorridorS5R3-v0", 10),
+        ("MiniGrid-KeyCorridorS6R3-v0", 10),
     ]
 
     print("=" * 70)

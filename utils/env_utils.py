@@ -18,6 +18,11 @@ import minigrid  # noqa: F401  (registers MiniGrid envs)
 # Environment families the rule-based planner currently supports.
 # Other MiniGrid envs with the same mission templates will also work
 # but are not listed here as "officially supported".
+#
+# KeyCorridor uses the same mission template as UnlockPickup
+# ("pick up the <color> <obj>") and is handled by the same 10-stage
+# machine in RuleBasedPlanner. The six variants are kept ordered from
+# smallest to largest for use as the default curriculum.
 SUPPORTED_ENVS: tuple[str, ...] = (
     "MiniGrid-DoorKey-5x5-v0",
     "MiniGrid-DoorKey-8x8-v0",
@@ -28,6 +33,54 @@ SUPPORTED_ENVS: tuple[str, ...] = (
     "MiniGrid-GoToObject-6x6-N2-v0",
     "MiniGrid-GoToObject-8x8-N2-v0",
     "MiniGrid-UnlockPickup-v0",
+    "MiniGrid-KeyCorridorS3R1-v0",
+    "MiniGrid-KeyCorridorS3R2-v0",
+    "MiniGrid-KeyCorridorS3R3-v0",
+    "MiniGrid-KeyCorridorS4R3-v0",
+    "MiniGrid-KeyCorridorS5R3-v0",
+    "MiniGrid-KeyCorridorS6R3-v0",
+)
+
+# Canonical paper curriculum for train_lgrl_curriculum.py.
+#
+# Paper §4.1: "the agent is first trained on the simpler GoToDoor and
+# GoToObject tasks to acquire basic navigation abilities. The curriculum
+# then progresses to increasingly larger instances of the KeyCorridor
+# environment..."
+#
+# §4.4: "training progressing through smaller grid layouts to more
+# complex configurations."
+#
+# Ordering: 3 GoToDoor sizes -> 2 GoToObject sizes -> 6 KeyCorridor
+# variants (S3R1 -> S6R3). UnlockPickup is intentionally NOT part of the
+# curriculum — the paper treats it as a zero-shot transfer test
+# environment (Table 2). The user can override via --curriculum.
+DEFAULT_CURRICULUM: tuple[str, ...] = (
+    # Stage 1-3: Basic navigation - go to a named door
+    "MiniGrid-GoToDoor-5x5-v0",
+    "MiniGrid-GoToDoor-6x6-v0",
+    "MiniGrid-GoToDoor-8x8-v0",
+    # Stage 4-5: Basic navigation - go to a named object
+    "MiniGrid-GoToObject-6x6-N2-v0",
+    "MiniGrid-GoToObject-8x8-N2-v0",
+    # Stage 6-11: KeyCorridor, smallest to largest
+    "MiniGrid-KeyCorridorS3R1-v0",
+    "MiniGrid-KeyCorridorS3R2-v0",
+    "MiniGrid-KeyCorridorS3R3-v0",
+    "MiniGrid-KeyCorridorS4R3-v0",
+    "MiniGrid-KeyCorridorS5R3-v0",
+    "MiniGrid-KeyCorridorS6R3-v0",
+)
+
+# Sub-curriculum: KeyCorridor only (the §4.4 sub-curriculum). Kept as a
+# convenience for ablation runs where the GoTo bootstrap is skipped.
+DEFAULT_KEYCORRIDOR_CURRICULUM: tuple[str, ...] = (
+    "MiniGrid-KeyCorridorS3R1-v0",
+    "MiniGrid-KeyCorridorS3R2-v0",
+    "MiniGrid-KeyCorridorS3R3-v0",
+    "MiniGrid-KeyCorridorS4R3-v0",
+    "MiniGrid-KeyCorridorS5R3-v0",
+    "MiniGrid-KeyCorridorS6R3-v0",
 )
 
 # DoorKey-5x5 keeps legacy artifact names ("baseline.pt", "lgrl.pt",
@@ -164,3 +217,75 @@ def mix_artifact_stem(base: str, mix: list[tuple[str, int]]) -> str:
     env_tags = "_".join(env_stem(e) for e, _ in mix)
     ratios = "to".join(str(r) for _, r in mix)
     return f"{base}_mix_{env_tags}_{ratios}"
+
+
+# ---------------------------------------------------------------------------
+# Curriculum-task helpers (paper §4.4 — KeyCorridor progressive training)
+# ---------------------------------------------------------------------------
+
+def parse_curriculum_spec(spec: str) -> list[str]:
+    """Parse ``--curriculum env1,env2,env3`` into a list of env names.
+
+    Validates that each env is in ``SUPPORTED_ENVS`` and that at least two
+    envs are listed (a one-env curriculum is just a normal single-env
+    run).
+    """
+    envs = [e.strip() for e in spec.split(",") if e.strip()]
+    if len(envs) < 2:
+        raise SystemExit(
+            f"--curriculum needs at least two env names separated by ',', "
+            f"got {spec!r}"
+        )
+    seen: set[str] = set()
+    for e in envs:
+        if e not in SUPPORTED_ENVS:
+            raise SystemExit(f"--curriculum env {e!r} not in SUPPORTED_ENVS")
+        if e in seen:
+            raise SystemExit(f"--curriculum env {e!r} repeated")
+        seen.add(e)
+    return envs
+
+
+def curriculum_artifact_stem(base: str, envs: list[str]) -> str:
+    """Artifact stem for a curriculum run.
+
+    Short forms for the two canonical curricula keep filenames readable:
+      - The full paper curriculum (DEFAULT_CURRICULUM) -> ``..._paper``
+      - A contiguous KeyCorridor-only sweep -> ``..._keycorridor_<first>_to_<last>``
+
+    Anything else falls back to listing every env stem joined by ``_``.
+
+    Examples::
+
+        # Canonical paper curriculum (GoToDoor x3 -> GoToObject x2 -> KC x6)
+        curriculum_artifact_stem("lgrl_rule", list(DEFAULT_CURRICULUM))
+        -> "lgrl_rule_curriculum_paper"
+
+        # KeyCorridor-only ablation
+        curriculum_artifact_stem("lgrl_rule",
+            ["MiniGrid-KeyCorridorS3R1-v0",
+             "MiniGrid-KeyCorridorS3R2-v0",
+             "MiniGrid-KeyCorridorS3R3-v0"])
+        -> "lgrl_rule_curriculum_keycorridor_s3r1_to_s3r3"
+
+        # Arbitrary custom curriculum
+        curriculum_artifact_stem("lgrl_rule",
+            ["MiniGrid-DoorKey-5x5-v0",
+             "MiniGrid-DoorKey-8x8-v0"])
+        -> "lgrl_rule_curriculum_doorkey5x5_doorkey8x8"
+    """
+    if tuple(envs) == DEFAULT_CURRICULUM:
+        return f"{base}_curriculum_paper"
+
+    is_keycorridor_only = all("KeyCorridor" in e for e in envs)
+    if is_keycorridor_only and len(envs) >= 2:
+        # KeyCorridorS3R1 -> "s3r1"
+        def short(name: str) -> str:
+            tag = env_stem(name)
+            return tag[len("keycorridor"):]
+        return (
+            f"{base}_curriculum_keycorridor_"
+            f"{short(envs[0])}_to_{short(envs[-1])}"
+        )
+    env_tags = "_".join(env_stem(e) for e in envs)
+    return f"{base}_curriculum_{env_tags}"

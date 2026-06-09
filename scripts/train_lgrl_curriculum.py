@@ -1,23 +1,17 @@
 """
 train_lgrl_curriculum.py — Curriculum PPO training for LGRL (rule-based oracle).
 
-Implements the curriculum-learning setup from the LGRL paper §4.1 + §4.4:
-
-    §4.1: "the agent is first trained on the simpler GoToDoor and
-    GoToObject tasks to acquire basic navigation abilities. The
-    curriculum then progresses to increasingly larger instances of the
-    KeyCorridor environment..."
-
-    §4.4: "training progressing through smaller grid layouts to more
-    complex configurations."
+Curriculum-learning setup: the agent is first trained on the simpler
+GoToDoor and GoToObject tasks to acquire basic navigation abilities, then
+the curriculum progresses to increasingly larger instances of the
+KeyCorridor environment.
 
 The default curriculum has 11 stages: GoToDoor 5x5/6x6/8x8 -> GoToObject
 6x6/8x8 -> KeyCorridor S3R1/S3R2/S3R3/S4R3/S5R3/S6R3.
 
-UnlockPickup is intentionally NOT in the curriculum. The paper treats it
-as a zero-shot transfer test environment (Table 2). To reproduce that
-result, evaluate the final checkpoint of this run on UnlockPickup
-without further training.
+UnlockPickup is intentionally NOT in the curriculum. We treat it as a
+zero-shot transfer test environment: evaluate the final checkpoint of
+this run on UnlockPickup without further training.
 
 Each stage advances to the next when EITHER:
 
@@ -40,20 +34,20 @@ config (``n_subgoals``, ``T_max``, family) are rebuilt for the new
 stage. The agent therefore inherits everything it learned on earlier
 stages into the harder ones.
 
-Same PPO loop and reward shaping (Eqs. 5-7) as train_lgrl_rule.py. The
+Same PPO loop and reward shaping as train_lgrl_rule.py. The
 KeyCorridor stages reuse the existing 10-stage UnlockPickup machine in
 ``RuleBasedPlanner`` (same mission template + same structure: find key
 -> open locked door -> drop key -> pickup target).
 
 Artifact naming:
-  - The canonical paper curriculum gets a compact stem:
-        checkpoints/lgrl_rule_curriculum_paper.pt
+  - The default curriculum gets a compact stem:
+        checkpoints/lgrl_rule_curriculum_default.pt
   - A KeyCorridor-only sweep gets:
         checkpoints/lgrl_rule_curriculum_keycorridor_s3r1_to_s6r3.pt
   - Other custom curricula list every env tag.
 
 Usage:
-    # Full paper curriculum (default): 11 stages, up to 50M frames each
+    # Full default curriculum: 11 stages, up to 50M frames each
     python scripts/train_lgrl_curriculum.py
 
     # Custom curriculum
@@ -125,20 +119,20 @@ from utils.subgoal_logger import SubgoalLogger
 NUM_ENVS = 16
 NUM_FRAMES_PER_PROC = 128
 
-# PPO hyperparameters from LGRL paper (Section 4.3) — same as train_lgrl_rule.py
+# PPO hyperparameters — same as train_lgrl_rule.py
 LR = 1e-4
 DISCOUNT = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 BATCH_SIZE = 256
-# torch-ac-style defaults (paper silent on these)
+# torch-ac-style defaults
 ENTROPY_COEF = 0.01
 VALUE_LOSS_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 EPOCHS = 4
 RECURRENCE = 4
 
-# Reward scaffolding from LGRL paper (Eqs. 5–7) — same as train_lgrl_rule.py
+# Reward scaffolding — same as train_lgrl_rule.py
 R_MISSION = 0.5
 R_SUBGOAL = 0.5
 MISSION_TIME_COEF = 0.5
@@ -193,7 +187,7 @@ def parse_args():
         type=str,
         help=(
             "Comma-separated list of env names from easiest to hardest. "
-            "Default: paper canonical 11-stage curriculum "
+            "Default: the 11-stage curriculum "
             "(GoToDoor 5x5/6x6/8x8 -> GoToObject 6x6/8x8 -> "
             "KeyCorridor S3R1/S3R2/S3R3/S4R3/S5R3/S6R3)."
         ),
@@ -342,7 +336,7 @@ class HierarchyState:
         self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """Ti = (i / n) * Tmax  (paper Eq. 6)."""
+        """Ti = (i / n) * Tmax."""
         n = self.n_subgoals_per_env[env_idx]
         t_max = self.t_max_per_env[env_idx]
         i = min(self.stage_indices[env_idx] + 1, n)
@@ -432,7 +426,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
         if done:
             success = reward > 0
             if success:
-                # Paper Eq. 5: rm = Rm * (1 - 0.5 * Tused/Tmax)
+                # Mission reward: rm = Rm * (1 - 0.5 * Tused/Tmax)
                 t_total = hierarchy_state.episode_steps[env_idx]
                 ratio = min(t_total / t_max, 1.0)
                 total_reward += R_MISSION * (1.0 - MISSION_TIME_COEF * ratio)
@@ -476,10 +470,10 @@ def make_reshape_reward(hierarchy_state, logger=None):
         timed_out = t_used > SUBGOAL_TIMEOUT_MULT * t_budget
 
         if completed:
-            # Paper Eq. 6: ri = Rt * (1 - 0.5 * Tused/Ti), clipped at 2*Ti
+            # Subgoal reward: ri = Rt * (1 - 0.5 * Tused/Ti), clipped at 2*Ti
             ratio = min(t_used / max(t_budget, 1), SUBGOAL_TIMEOUT_MULT)
             r_i = max(R_SUBGOAL * (1.0 - SUBGOAL_TIME_COEF * ratio), 0.0)
-            # Paper Eq. 7: normalise by n
+            # Normalise by the number of stages
             total_reward += r_i / n_subgoals
 
             hierarchy_state.histories[env_idx].append(

@@ -2,6 +2,8 @@
 
 This repository contains the codebase for our CMPE 492 Senior Project at Bogazici University. We implement and evaluate an LLM-assisted hierarchical reinforcement learning architecture where a large language model decomposes high-level missions into subgoals that guide a PPO agent's exploration and decision-making in interactive grid-world environments.
 
+Our approach builds on the LLM-Guided Reinforcement Learning (LGRL) framework of Yang, Liu, and Li (2025); everything in this repository is our own implementation.
+
 
 **Team:** Onur Kucuk & Yusuf Akdogan
 **Advisor:** Emre Ugur
@@ -19,10 +21,14 @@ Official project documentation, timeline, and milestones are in the [Repository 
 │   ├── baseline_agent.py       # Recurrent actor-critic (mission-only baseline)
 │   └── lgrl_agent.py           # LGRL actor-critic (mission + subgoal via [SEP])
 ├── scripts/
-│   ├── train_baseline.py       # Baseline PPO training (no subgoal guidance)
-│   ├── train_lgrl.py           # LGRL training (LLM planner by default)
-│   ├── train_lgrl_rule.py      # LGRL rule oracle (standalone script)
-│   └── eval_lgrl.py            # Evaluate checkpoints (5-env suite)
+│   ├── train_baseline.py        # Baseline PPO training (no subgoal guidance)
+│   ├── train_lgrl.py            # LGRL training (LLM planner by default)
+│   ├── train_lgrl_rule.py       # LGRL rule oracle (standalone script)
+│   ├── train_lgrl_curriculum.py # Curriculum / transfer training across envs
+│   ├── run_experiment1.py       # Env scale × subgoal budget ablation
+│   ├── run_experiment2.py       # Reward-parameter balancing ablation
+│   ├── run_experiment3.py       # Decaying subgoal-budget schedule
+│   └── eval_lgrl.py             # Evaluate checkpoints (5-env suite)
 ├── utils/
 │   ├── __init__.py
 │   ├── env_parser.py           # MiniGrid 7x7 observation -> JSON for the LLM
@@ -34,6 +40,7 @@ Official project documentation, timeline, and milestones are in the [Repository 
 │   ├── sequential_env.py       # Single-process env stepper for torch-ac
 │   ├── eval_config.py          # Five-env evaluation suite configuration
 │   └── checkpoint_utils.py     # Checkpoint load / metadata helpers
+├── crafter/                    # LGRL adapted to the Crafter survival game (own README)
 ├── checkpoints/                # Saved model weights (git-ignored)
 ├── logs/                       # Metrics CSV, plots & subgoal logs (git-ignored)
 ├── requirements.txt
@@ -57,7 +64,7 @@ ollama pull qwen2.5:7b
 
 ## Supported Environments
 
-All three training scripts accept `--env <env_id>`. Supported environments mirror the curriculum from the LGRL paper:
+All three training scripts accept `--env <env_id>`. The supported environments are:
 
 | Env ID                              | Mission template                                        | Stages | `T_max` (from `env.max_steps`) |
 |-------------------------------------|---------------------------------------------------------|:------:|:------------------------------:|
@@ -69,7 +76,7 @@ All three training scripts accept `--env <env_id>`. Supported environments mirro
 | `MiniGrid-GoToObject-8x8-N2-v0`     | `go to the <color> <key\|ball\|box>`                    | 2      | 320                            |
 | `MiniGrid-UnlockPickup-v0`          | `pick up the <color> box`                               | 10     | 288                            |
 
-The `GoToDoor` and `GoToObject` families end when the agent issues the `done` action (MiniGrid action 6) while adjacent to the correct target; reaching that state gives the positive environment reward that triggers our mission-level reward (Eq. 5).
+The `GoToDoor` and `GoToObject` families end when the agent issues the `done` action (MiniGrid action 6) while adjacent to the correct target; reaching that state gives the positive environment reward that triggers our mission-level reward.
 
 The `UnlockPickup` family ends when the agent picks up the target object in the locked room. It is the only family in this codebase where the mission text mentions a *target* color while the **key/door color is different and inferred from observation**.
 
@@ -165,12 +172,12 @@ Artifacts for DoorKey-5x5:
 
 For any other env, swap `lgrl_rule` → `lgrl_rule_<envtag>`.
 
-### Mixed-task training (paper §4.5)
+### Mixed-task training
 
-The paper does **not** train UnlockPickup standalone from scratch. The reward is too sparse for random exploration to bootstrap (a uniform-random policy effectively never solves an episode within `T_max`, so PPO has no learning signal). Two setups are reported instead:
+We do **not** train UnlockPickup standalone from scratch. The reward is too sparse for random exploration to bootstrap (a uniform-random policy effectively never solves an episode within `T_max`, so PPO has no learning signal). We use two setups instead:
 
-- §4.4 (Table 2): UnlockPickup is tested as **zero-shot transfer** from a KeyCorridor-trained agent.
-- §4.5 (single-step convergence, Fig. 3): UnlockPickup is trained **mixed** with `GoToObject` at a 1:3 ratio. The easy task gives the agent dense reward signal for navigation while it learns the harder task.
+- **Zero-shot transfer:** UnlockPickup is tested with a KeyCorridor-trained agent, without further training.
+- **Mixed training:** UnlockPickup is trained **mixed** with `GoToObject` at a 1:3 ratio. The easy task gives the agent dense reward signal for navigation while it learns the harder task.
 
 `--mix` is mutually exclusive with `--env`. Format: `env1:r1,env2:r2`. The total ratio must divide `NUM_ENVS=16` evenly. With ratio 1:3 you get 4 UnlockPickup + 12 GoToObject worker envs. All three training scripts support it identically:
 
@@ -240,7 +247,7 @@ The rule-based planner dispatches on the mission string. The forward-only stage 
 | 0     | `search for the [color] door`  | Door already visible → jump to stage 1      |
 | 1     | `go near the [color] door`     | —                                           |
 
-The mission-completion reward (Eq. 5) is granted when the agent issues `done` next to the correct door. The `go near` subgoal rewards the agent for becoming cardinally adjacent to the door before that final `done`.
+The mission-completion reward is granted when the agent issues `done` next to the correct door. The `go near` subgoal rewards the agent for becoming cardinally adjacent to the door before that final `done`.
 
 #### GoToObject (2 stages)
 
@@ -268,9 +275,9 @@ The only family where the mission text mentions a target color while the **key/d
 | 8     | `go near the [target_color] [target_object]`     | Carrying target → jump to stage 9                        |
 | 9     | `pickup the [target_color] [target_object]`      | —                                                        |
 
-The mission ends when the agent picks up the target — the env emits a positive reward at that moment, which triggers the mission-level reward (Eq. 5). With the explicit drop at stage 6 the inventory is empty by the time the agent reaches the target, so the stage-9 pickup is unblocked.
+The mission ends when the agent picks up the target — the env emits a positive reward at that moment, which triggers the mission-level reward. With the explicit drop at stage 6 the inventory is empty by the time the agent reaches the target, so the stage-9 pickup is unblocked.
 
-### Reward Scaffolding (LGRL paper Eqs. 5–7)
+### Reward Scaffolding
 
 | Symbol           | Formula                                                                        | Default                            |
 |------------------|--------------------------------------------------------------------------------|------------------------------------|
@@ -290,26 +297,26 @@ All reward-shaping parameters are defined at the top of `train_lgrl.py` and `tra
 |------------------------|---------------------|-----------------------------------------------------------------|-----------------------------------------------------------------------|
 | `R_MISSION`            | `0.5`               | Max mission-completion reward (`R_m`)                           | `R_MISSION + R_SUBGOAL` sets the max episode return (1.0 by default)  |
 | `R_SUBGOAL`            | `0.5`               | Max per-subgoal reward (`R_t`) before 1/N normalization         | See above                                                             |
-| `MISSION_TIME_COEF`    | `0.5`               | 0.5 factor in Eq. 5                                             | At 0.5 an agent finishing at `T_max` still gets `0.25 * R_MISSION`    |
-| `SUBGOAL_TIME_COEF`    | `0.5`               | 0.5 factor in Eq. 6                                             | Same shape as mission penalty                                         |
-| `T_max`                | `env.max_steps`     | Paper's `T_max`, derived from the env at startup                | Per-env: 250 / 100 / 144 / 256 / 180 / 320 / 288 (see table)          |
+| `MISSION_TIME_COEF`    | `0.5`               | Time-penalty factor on the mission reward                       | At 0.5 an agent finishing at `T_max` still gets `0.25 * R_MISSION`    |
+| `SUBGOAL_TIME_COEF`    | `0.5`               | Time-penalty factor on the subgoal reward                       | Same shape as mission penalty                                         |
+| `T_max`                | `env.max_steps`     | Step budget, derived from the env at startup                    | Per-env: 250 / 100 / 144 / 256 / 180 / 320 / 288 (see table)          |
 | `SUBGOAL_TIMEOUT_MULT` | `2.0`               | Subgoal times out when `T_used > mult * T_i`                    | Also caps the ratio in the subgoal reward formula                     |
 | `N_SUBGOALS`           | derived from env    | Number of stages for this env family (5 / 2 / 2 / 10)           | Queried from `RuleBasedPlanner.num_stages(mission)` at startup         |
 
-### PPO Hyperparameters (LGRL paper Section 4.3)
+### PPO Hyperparameters
 
-| Parameter          | Value   | Source                           |
-|--------------------|---------|----------------------------------|
-| `LR`               | `1e-4`  | Paper §4.3                       |
-| `DISCOUNT`         | `0.99`  | Paper §4.3                       |
-| `GAE_LAMBDA`       | `0.95`  | Paper §4.3                       |
-| `CLIP_EPS`         | `0.2`   | Paper §4.3                       |
-| `BATCH_SIZE`       | `256`   | Paper §4.3                       |
-| `ENTROPY_COEF`     | `0.01`  | torch-ac default (paper silent)  |
-| `VALUE_LOSS_COEF`  | `0.5`   | torch-ac default (paper silent)  |
-| `MAX_GRAD_NORM`    | `0.5`   | torch-ac default (paper silent)  |
-| `EPOCHS`           | `4`     | torch-ac default (paper silent)  |
-| `RECURRENCE`       | `4`     | torch-ac default (paper silent)  |
+| Parameter          | Value   | Notes                |
+|--------------------|---------|----------------------|
+| `LR`               | `1e-4`  |                      |
+| `DISCOUNT`         | `0.99`  |                      |
+| `GAE_LAMBDA`       | `0.95`  |                      |
+| `CLIP_EPS`         | `0.2`   |                      |
+| `BATCH_SIZE`       | `256`   |                      |
+| `ENTROPY_COEF`     | `0.01`  | torch-ac default     |
+| `VALUE_LOSS_COEF`  | `0.5`   | torch-ac default     |
+| `MAX_GRAD_NORM`    | `0.5`   | torch-ac default     |
+| `EPOCHS`           | `4`     | torch-ac default     |
+| `RECURRENCE`       | `4`     | torch-ac default     |
 
 ### Subgoal Logging
 
@@ -351,7 +358,7 @@ Other envs use tagged names, e.g. `checkpoints/lgrl_rule_unlockpickup.pt`.
 
 `scripts/eval_lgrl.py` loads a trained checkpoint and measures performance over many episodes. It reports **success rate**, **average return** (raw MiniGrid reward), **average steps**, and **mean policy entropy** per environment, and writes detailed JSONL traces for debugging.
 
-**Intended workflow (LGRL paper style):** train with the **rule-based** oracle (`train_lgrl_rule.py`), then evaluate with the **LLM** planner so subgoals at test time come from Ollama. You can also evaluate with `--planner rule_based` (no Ollama) or run a **baseline** checkpoint with `--agent baseline`.
+**Intended workflow:** train with the **rule-based** oracle (`train_lgrl_rule.py`), then evaluate with the **LLM** planner so subgoals at test time come from Ollama. You can also evaluate with `--planner rule_based` (no Ollama) or run a **baseline** checkpoint with `--agent baseline`.
 
 Benchmark environments are defined in `utils/eval_config.py`:
 
@@ -413,7 +420,7 @@ python scripts/eval_lgrl.py ^
     --planner llm --episodes 100 --envs unlockpickup
 ```
 
-**Example 3 — Full five-environment suite (paper-style, 1000 episodes each)**
+**Example 3 — Full five-environment suite (1000 episodes each)**
 
 ```bash
 python scripts/eval_lgrl.py --checkpoint checkpoints/lgrl_rule.pt --planner llm

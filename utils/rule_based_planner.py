@@ -1,9 +1,9 @@
 """
 Deterministic rule-based subgoal generator for MiniGrid environments.
 
-Implements forward-only stage machines that produce the subgoal types
-from the LGRL paper plus "go near": search for, go near, pickup, open,
-close, drop. No "explore" or "go to" subgoals.
+Implements forward-only stage machines that produce these subgoal types:
+search for, go near, pickup, open, close, drop. No "explore" or "go to"
+subgoals.
 
 Supported environments:
 
@@ -59,7 +59,7 @@ import json
 KNOWN_COLORS = {"red", "green", "blue", "purple", "yellow", "grey"}
 KNOWN_OBJECTS = {"key", "ball", "box", "door", "goal"}
 
-# Per-mission-family stage counts (paper Eq. 6 n)
+# Per-mission-family stage counts (n)
 DOORKEY_STAGES = 5
 GOTO_STAGES = 2
 UNLOCKPICKUP_STAGES = 10
@@ -248,7 +248,7 @@ class RuleBasedPlanner:
         Stage 1 — go near the <color> door     (agent adjacent)
 
         The mission is solved by executing `done` next to the target door;
-        the mission-level reward (Eq. 5) handles that terminal action.
+        the mission-level reward handles that terminal action.
         """
         color = _mission_color(mission)
         search_label = (

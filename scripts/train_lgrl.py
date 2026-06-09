@@ -12,12 +12,12 @@ Supported environments:
 Two training modes:
   - Single-env (--env): all 16 worker envs run the same task. Backward
     compatible with previous CSV/checkpoint formats.
-  - Mixed-task (--mix, paper §4.5): worker envs are split across multiple
+  - Mixed-task (--mix): worker envs are split across multiple
     env types according to a ratio, e.g. 4 UnlockPickup + 12 GoToObject.
     Used to bootstrap UnlockPickup convergence by giving the agent dense
     rewards from the easier task while it learns the harder one.
 
-Subgoals follow the LGRL paper: search for, pickup, open, close, drop.
+Subgoals: search for, pickup, open, close, drop.
 No "explore" or "go to".
 
 Artifact naming:
@@ -86,20 +86,20 @@ NUM_ENVS            = 16
 NUM_FRAMES_PER_PROC = 128
 TOTAL_FRAMES        = 10_000_000
 
-# PPO hyperparameters from LGRL paper (Section 4.3)
+# PPO hyperparameters
 LR              = 1e-4
 DISCOUNT        = 0.99
 GAE_LAMBDA      = 0.95
 CLIP_EPS        = 0.2
 BATCH_SIZE      = 256
-# Not specified in the paper
+# torch-ac-style defaults
 ENTROPY_COEF    = 0.01
 VALUE_LOSS_COEF = 0.5
 MAX_GRAD_NORM   = 0.5
 EPOCHS          = 4
 RECURRENCE      = 4
 
-# Reward scaffolding (paper Eqs. 5–7)
+# Reward scaffolding
 R_MISSION            = 0.5
 R_SUBGOAL            = 0.5
 MISSION_TIME_COEF    = 0.5
@@ -137,7 +137,7 @@ def parse_args():
         metavar="SPEC",
         help=(
             "Mixed-task spec: 'env1:r1,env2:r2'. Total ratio must divide "
-            "NUM_ENVS evenly. Example (paper §4.5): "
+            "NUM_ENVS evenly. Example: "
             "'MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3'"
         ),
     )
@@ -286,7 +286,7 @@ def make_env(env_name: str, seed: int):
 
 def make_reshape_reward(hierarchy_state, logger=None):
     """Build the reward callback. Per-env n_subgoals and T_max so that
-    mixed-task training (paper §4.5) works correctly."""
+    mixed-task training works correctly."""
 
     def reshape_reward(obs, action, reward, done):
         env_idx = reshape_reward._current_env_idx

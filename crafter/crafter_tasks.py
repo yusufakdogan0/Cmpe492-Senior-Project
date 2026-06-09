@@ -9,7 +9,7 @@ Crafter (https://github.com/danijar/crafter) is a 2D survival game with a
 22-achievement tech tree. We treat a single target achievement as the
 "mission" and decompose it into an ordered, forward-only sequence of
 subgoal *stages* — exactly the structure the LGRL reward scaffold
-(paper Eqs. 5-7) expects.
+expects.
 
 Everything in here is pure data + logic (no torch, no crafter runtime),
 so it can be unit-tested in isolation. The recipe numbers are copied
@@ -155,7 +155,7 @@ MISSION_TO_TASK: dict[str, str] = {v: k for k, v in TASK_MISSION.items()}
 # Tech-tree spine, easiest -> hardest. Each later task subsumes the skills
 # of the earlier ones, so carrying the agent forward across stages
 # (train_lgrl_curriculum.py) gives compounding transfer — the Crafter
-# analogue of the paper's GoToDoor -> GoToObject -> KeyCorridor curriculum.
+# analogue of the MiniGrid GoToDoor -> GoToObject -> KeyCorridor curriculum.
 DEFAULT_CURRICULUM: tuple[str, ...] = (
     "collect_wood",
     "place_table",
@@ -308,12 +308,12 @@ STAGE_PLANS: dict[str, list[dict]] = {t: build_stage_plan(t) for t in SUPPORTED_
 
 
 def num_subgoals(task: str) -> int:
-    """Number of reward-bearing stages (paper Eq. 6 'n')."""
+    """Number of reward-bearing stages ('n')."""
     return len(STAGE_PLANS[task])
 
 
 def task_max_steps(task: str) -> int:
-    """Per-task step budget (paper T_max). Scaled by plan depth; deeper
+    """Per-task step budget (T_max). Scaled by plan depth; deeper
     tech-tree targets get a longer horizon. Crafter's native 10k cap is
     far too long for per-subgoal time budgeting."""
     n = num_subgoals(task)

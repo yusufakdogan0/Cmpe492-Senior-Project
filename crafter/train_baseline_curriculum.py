@@ -119,7 +119,7 @@ def _build_algo_for_stage(model, vocab, task, seed, optimizer_state=None):
     Baseline analogue of the LGRL curriculum's builder: an EpisodeTracker
     (success bookkeeping only) replaces the HierarchyState, the text stream
     sees the mission alone (no subgoal), and the reward is passed through raw
-    (no Eqs. 5-7 shaping)."""
+    (no subgoal/mission shaping)."""
     t_max = task_max_steps(task)
     envs = [CrafterTaskEnv(task, seed=seed * 1000 + i) for i in range(NUM_ENVS)]
 

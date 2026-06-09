@@ -1,7 +1,7 @@
 """
 Subgoal completion verification for MiniGrid environments.
 
-Supports the subgoal types from the LGRL paper plus "go near":
+Supports these subgoal types:
   - search for the [color] [object]
   - go near the [color] [object]      (agent adjacent to target)
   - pickup the [color] [object]

@@ -3,17 +3,15 @@ train_lgrl_curriculum.py — curriculum / transfer-learning PPO training for
 LGRL on Crafter (rule-based oracle).
 
 This is the Crafter analogue of the MiniGrid project's
-``scripts/train_lgrl_curriculum.py`` and implements the transfer-learning
-idea you asked for: train on a sequence of Crafter targets from EASIEST to
-HARDEST, carrying the agent's weights + optimizer state forward across
-stage boundaries so each harder target inherits everything learned on the
-shallower ones.
+``scripts/train_lgrl_curriculum.py`` and implements transfer learning:
+train on a sequence of Crafter targets from EASIEST to HARDEST, carrying
+the agent's weights + optimizer state forward across stage boundaries so
+each harder target inherits everything learned on the shallower ones.
 
-This mirrors the paper's curriculum (§4.1 / §4.4): "first trained on the
-simpler ... tasks to acquire basic navigation abilities. The curriculum
-then progresses to increasingly ... complex configurations." In Crafter
-the tech tree gives a natural difficulty ordering, because each later
-target literally requires the skills of the earlier ones:
+The agent is first trained on the simpler tasks to acquire basic skills,
+then the curriculum progresses to increasingly complex configurations. In
+Crafter the tech tree gives a natural difficulty ordering, because each
+later target literally requires the skills of the earlier ones:
 
     collect_wood -> place_table -> make_wood_pickaxe -> collect_stone
     -> make_stone_pickaxe -> place_furnace -> collect_coal -> collect_iron
@@ -31,7 +29,7 @@ Each stage advances to the next when EITHER:
 Model parameters, vocabulary, and optimizer state are preserved across
 stage boundaries; only the env workers and the per-stage config
 (``n_subgoals``, ``T_max``, target) are rebuilt. Same PPO loop and reward
-shaping (Eqs. 5-7) as ``train_lgrl_rule.py``.
+shaping as ``train_lgrl_rule.py``.
 
 Usage:
     # Full tech-tree curriculum (default), up to 1M frames per stage

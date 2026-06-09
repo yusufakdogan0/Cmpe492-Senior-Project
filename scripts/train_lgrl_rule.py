@@ -2,7 +2,7 @@
 LGRL PPO training with the rule-based oracle planner only.
 
 Stage-based hierarchy: the planner produces a fixed forward-only sequence
-of subgoals matching the LGRL paper. No "explore" or "go to" subgoals.
+of subgoals. No "explore" or "go to" subgoals.
 
 Supports four environment families:
   - MiniGrid-DoorKey-5x5-v0              (5 stages)
@@ -13,7 +13,7 @@ Supports four environment families:
 Two training modes:
   - Single-env (--env): all 16 worker envs run the same task. Backward
     compatible with previous CSV/checkpoint formats.
-  - Mixed-task (--mix, paper §4.5): worker envs are split across multiple
+  - Mixed-task (--mix): worker envs are split across multiple
     env types according to a ratio, e.g. 4 UnlockPickup + 12 GoToObject.
     Used to bootstrap UnlockPickup convergence by giving the agent dense
     rewards from the easier task while it learns the harder one.
@@ -89,25 +89,25 @@ NUM_ENVS = 16
 NUM_FRAMES_PER_PROC = 128
 TOTAL_FRAMES = 50_000_000
 
-# PPO hyperparameters from LGRL paper (Section 4.3)
+# PPO hyperparameters
 LR = 1e-4
 DISCOUNT = 0.99
 GAE_LAMBDA = 0.95
 CLIP_EPS = 0.2
 BATCH_SIZE = 256
-# Not specified in the paper; torch-ac-style defaults
+# torch-ac-style defaults
 ENTROPY_COEF = 0.01
 VALUE_LOSS_COEF = 0.5
 MAX_GRAD_NORM = 0.5
 EPOCHS = 4
 RECURRENCE = 4
 
-# Reward scaffolding from LGRL paper (Eqs. 5–7)
+# Reward scaffolding
 R_MISSION = 0.5                  # Rm
 R_SUBGOAL = 0.5                  # Rt
-MISSION_TIME_COEF = 0.5          # 0.5 factor in Eq. 5
-SUBGOAL_TIME_COEF = 0.5          # 0.5 factor in Eq. 6
-SUBGOAL_TIMEOUT_MULT = 2.0       # Eq. 6 "if Tused > 2*Ti, ri = 0"
+MISSION_TIME_COEF = 0.5          # time-penalty factor on the mission reward
+SUBGOAL_TIME_COEF = 0.5          # time-penalty factor on the subgoal reward
+SUBGOAL_TIMEOUT_MULT = 2.0       # if Tused > 2*Ti, ri = 0
 
 CHECKPOINT_DIR = os.path.join(PROJECT_ROOT, "checkpoints")
 CHECKPOINT_EVERY = 10
@@ -140,7 +140,7 @@ def parse_args():
         metavar="SPEC",
         help=(
             "Mixed-task spec: 'env1:r1,env2:r2'. Total ratio must divide "
-            "NUM_ENVS evenly. Example (paper §4.5): "
+            "NUM_ENVS evenly. Example: "
             "'MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3'"
         ),
     )
@@ -232,7 +232,7 @@ class HierarchyState:
         self.histories[env_idx] = []
 
     def subgoal_budget(self, env_idx: int) -> float:
-        """T_i = (i/n) * T_max  (paper Eq. 6), using per-env n and T_max."""
+        """T_i = (i/n) * T_max, using per-env n and T_max."""
         n = self.n_subgoals_per_env[env_idx]
         t_max = self.t_max_per_env[env_idx]
         i = min(self.stage_indices[env_idx] + 1, n)
@@ -311,7 +311,7 @@ def make_env(env_name: str, seed: int):
 def make_reshape_reward(hierarchy_state, logger=None):
     """Build the reward callback. Stage-based: each stage can only be
     completed once per episode. Per-env n_subgoals and T_max so that
-    mixed-task training (paper §4.5) works correctly."""
+    mixed-task training works correctly."""
 
     def reshape_reward(obs, action, reward, done):
         env_idx = reshape_reward._current_env_idx
@@ -332,7 +332,7 @@ def make_reshape_reward(hierarchy_state, logger=None):
         if done:
             success = reward > 0
             if success:
-                # Paper Eq. 5: rm = Rm * (1 - 0.5 * Tused/Tmax)
+                # Mission reward: rm = Rm * (1 - 0.5 * Tused/Tmax)
                 t_total = hierarchy_state.episode_steps[env_idx]
                 ratio = min(t_total / t_max, 1.0)
                 total_reward += R_MISSION * (1.0 - MISSION_TIME_COEF * ratio)
@@ -382,10 +382,10 @@ def make_reshape_reward(hierarchy_state, logger=None):
         timed_out = t_used > SUBGOAL_TIMEOUT_MULT * t_budget
 
         if completed:
-            # Paper Eq. 6: ri = Rt * (1 - 0.5 * Tused/Ti), clipped at 2*Ti
+            # Subgoal reward: ri = Rt * (1 - 0.5 * Tused/Ti), clipped at 2*Ti
             ratio = min(t_used / max(t_budget, 1), SUBGOAL_TIMEOUT_MULT)
             r_i = max(R_SUBGOAL * (1.0 - SUBGOAL_TIME_COEF * ratio), 0.0)
-            # Paper Eq. 7: normalize by n
+            # Normalize by the number of stages
             total_reward += r_i / n_subgoals
 
             hierarchy_state.histories[env_idx].append(

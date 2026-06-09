@@ -1,9 +1,9 @@
 """
 Evaluation suite configuration for LGRL checkpoint benchmarking.
 
-Default suite mirrors the LGRL paper environments used for transfer
-testing (GoToDoor, GoToObject, KeyCorridor, UnlockPickup) plus the
-project's DoorKey-5x5 training default.
+Default suite covers the environments used for transfer testing
+(GoToDoor, GoToObject, KeyCorridor, UnlockPickup) plus the project's
+DoorKey-5x5 training default.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from typing import Optional
 from utils.env_utils import env_max_steps
 from utils.rule_based_planner import DOORKEY_STAGES, RuleBasedPlanner
 
-# Paper Table 2 style episode count
+# Default episode count for benchmarking
 DEFAULT_NUM_EPISODES = 1000
 DEFAULT_SEED_START = 0
 DEFAULT_SUBGOAL_TIMEOUT_MULT = 2.0

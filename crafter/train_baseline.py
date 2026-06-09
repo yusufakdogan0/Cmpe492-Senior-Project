@@ -7,10 +7,10 @@ planner, no subgoals, no reward shaping. It learns from the sparse
 environment reward (+1 the step the target achievement unlocks, 0
 otherwise), so its average return equals its success rate.
 
-This is the "Base" condition the LGRL agent is compared against (paper
-Table 2): same network architecture (``CrafterACModel``) and same PPO
-hyperparameters, differing only in that the text stream sees the mission
-alone and there is no subgoal scaffolding.
+This is the "Base" condition the LGRL agent is compared against: same
+network architecture (``CrafterACModel``) and same PPO hyperparameters,
+differing only in that the text stream sees the mission alone and there
+is no subgoal scaffolding.
 
 Usage:
     python crafter/train_baseline.py --task collect_wood

@@ -4,8 +4,8 @@ self-contained word vocabulary.
 
 The Crafter analogue of the MiniGrid project's ``lgrl_agent.py`` /
 ``baseline_agent.py``. A SINGLE architecture serves both the baseline and
-the LGRL agent — exactly as in the paper, where the two differ only in
-their text input (baseline = mission only; LGRL = "mission [SEP] subgoal").
+the LGRL agent — they differ only in their text input (baseline = mission
+only; LGRL = "mission [SEP] subgoal").
 Which text is fed is decided by the training script's preprocessing, not
 by the model.
 

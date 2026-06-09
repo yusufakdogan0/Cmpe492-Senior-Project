@@ -3,19 +3,20 @@
 This folder is a self-contained port of our LGRL (LLM-Guided Reinforcement
 Learning) framework from MiniGrid to [Crafter](https://github.com/danijar/crafter),
 a 2D open-world survival game with a 22-achievement tech tree. It is part
-of our CMPE 492 Senior Project at Boğaziçi University.
+of our CMPE 492 Senior Project at Boğaziçi University. See the main project
+README for the LGRL background and acknowledgment.
 
 **Team:** Onur Küçük & Yusuf Akdoğan
 **Advisor:** Emre Uğur
 
 The port keeps the LGRL **spine** identical to the MiniGrid implementation —
 
-> planner → subgoal → tracker verifies → reward scaffold (paper Eqs. 5–7) → PPO
+> planner → subgoal → tracker verifies → reward scaffold → PPO
 
 — and replaces only the environment-specific I/O. The reward scaffolding,
 PPO hyperparameters, forward-only stage logic, and per-subgoal time budgets
-are unchanged from the original work. Everything here imports from siblings
-in this folder, so it does **not** depend on the MiniGrid project's
+are unchanged from the MiniGrid implementation. Everything here imports from
+siblings in this folder, so it does **not** depend on the MiniGrid project's
 `models/` or `utils/`.
 
 ## Why Crafter
@@ -98,8 +99,7 @@ mirroring the MiniGrid planner/tracker split.
 5-tuple env with a MiniGrid-style episodic goal:
 
 - **Terminates with reward +1** the step the target achievement unlocks →
-  `success = reward > 0`, so the paper's mission reward (Eq. 5) transfers
-  unchanged.
+  `success = reward > 0`, so the mission reward transfers unchanged.
 - **Terminates with reward 0** on death.
 - **Truncates with reward 0** at `T_max`.
 
@@ -182,8 +182,7 @@ Artifacts: `checkpoints/lgrl_rule_<task>.pt`,
 Trains sequentially through the tech tree from easiest to hardest, **carrying
 the agent's weights and optimizer state forward** across stage boundaries so
 each harder target inherits everything learned on the shallower ones. This is
-the Crafter analogue of the paper's curriculum (§4.1 / §4.4) and of the
-transfer-learning setup in our MiniGrid work.
+the Crafter analogue of the transfer-learning curriculum in our MiniGrid work.
 
 Default curriculum:
 
@@ -234,7 +233,7 @@ Ollama server running on `localhost:11434`. `crafter_llm_planner.py` ships a
 Crafter-specific system prompt with the subgoal grammar, tech-tree rules, and
 four few-shot examples.
 
-## Reward scaffolding (paper Eqs. 5–7)
+## Reward scaffolding
 
 Identical to the MiniGrid scripts:
 
@@ -248,7 +247,7 @@ Identical to the MiniGrid scripts:
 
 Max possible episode return is `R_MISSION + R_SUBGOAL = 1.0`.
 
-## PPO hyperparameters (paper §4.3)
+## PPO hyperparameters
 
 `NUM_ENVS=16`, `NUM_FRAMES_PER_PROC=128`, `LR=1e-4`, `DISCOUNT=0.99`,
 `GAE_LAMBDA=0.95`, `CLIP_EPS=0.2`, `BATCH_SIZE=256`, `ENTROPY_COEF=0.01`,
@@ -257,7 +256,7 @@ Max possible episode return is `R_MISSION + R_SUBGOAL = 1.0`.
 ## Agent architecture
 
 `CrafterACModel` (used by **both** the baseline and LGRL — they differ only
-in their text input, exactly as in the paper):
+in their text input):
 
 - **Visual:** `64×64×3` → Conv(8×8,s4) → Conv(4×4,s2) → Conv(3×3,s1) →
   flatten (1024) → LSTM(128). (This Nature-style downsampling stack is the
@@ -285,7 +284,7 @@ python crafter/verify_pipeline.py
 Each module also has a `__main__` self-test (e.g. `python crafter/crafter_tasks.py`
 prints and validates every stage plan).
 
-## Evaluation plan (reproducing Table 2's shape)
+## Evaluation plan
 
 For each target task, compare **Base** (`train_baseline.py`),
 **LGRL** (`train_lgrl_rule.py` or the LLM planner), and the **curriculum /

@@ -1,13 +1,12 @@
 """
 Shared helpers for env-aware training scripts.
 
-- SUPPORTED_ENVS: the MiniGrid environments covered by the LGRL paper
-  that this project currently implements.
+- SUPPORTED_ENVS: the MiniGrid environments this project implements.
 - env_stem(): short filesystem-safe label derived from the env name.
 - resolve_artifact_stem(): joins a base stem with an env stem. When the
   env is the legacy default (DoorKey-5x5) the base is returned unchanged
   so existing checkpoints/CSVs keep working.
-- env_max_steps(): reads ``env.unwrapped.max_steps`` — the paper's Tmax.
+- env_max_steps(): reads ``env.unwrapped.max_steps`` — the env's Tmax.
 """
 
 from __future__ import annotations
@@ -41,20 +40,16 @@ SUPPORTED_ENVS: tuple[str, ...] = (
     "MiniGrid-KeyCorridorS6R3-v0",
 )
 
-# Canonical paper curriculum for train_lgrl_curriculum.py.
+# Default curriculum for train_lgrl_curriculum.py.
 #
-# Paper §4.1: "the agent is first trained on the simpler GoToDoor and
-# GoToObject tasks to acquire basic navigation abilities. The curriculum
-# then progresses to increasingly larger instances of the KeyCorridor
-# environment..."
-#
-# §4.4: "training progressing through smaller grid layouts to more
-# complex configurations."
+# The agent is first trained on the simpler GoToDoor and GoToObject tasks
+# to acquire basic navigation abilities, then the curriculum progresses to
+# increasingly larger instances of the KeyCorridor environment.
 #
 # Ordering: 3 GoToDoor sizes -> 2 GoToObject sizes -> 6 KeyCorridor
 # variants (S3R1 -> S6R3). UnlockPickup is intentionally NOT part of the
-# curriculum — the paper treats it as a zero-shot transfer test
-# environment (Table 2). The user can override via --curriculum.
+# curriculum — we treat it as a zero-shot transfer test environment. The
+# user can override via --curriculum.
 DEFAULT_CURRICULUM: tuple[str, ...] = (
     # Stage 1-3: Basic navigation - go to a named door
     "MiniGrid-GoToDoor-5x5-v0",
@@ -72,8 +67,8 @@ DEFAULT_CURRICULUM: tuple[str, ...] = (
     "MiniGrid-KeyCorridorS6R3-v0",
 )
 
-# Sub-curriculum: KeyCorridor only (the §4.4 sub-curriculum). Kept as a
-# convenience for ablation runs where the GoTo bootstrap is skipped.
+# Sub-curriculum: KeyCorridor only. Kept as a convenience for ablation
+# runs where the GoTo bootstrap is skipped.
 DEFAULT_KEYCORRIDOR_CURRICULUM: tuple[str, ...] = (
     "MiniGrid-KeyCorridorS3R1-v0",
     "MiniGrid-KeyCorridorS3R2-v0",
@@ -118,7 +113,7 @@ def resolve_artifact_stem(base: str, env_name: str) -> str:
 
 
 def env_max_steps(env_name: str) -> int:
-    """Read the env's max_steps (paper Tmax) by instantiating it once."""
+    """Read the env's max_steps (Tmax) by instantiating it once."""
     env = gym.make(env_name)
     try:
         return int(env.unwrapped.max_steps)
@@ -127,7 +122,7 @@ def env_max_steps(env_name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Mixed-task training helpers (paper §4.5 — UnlockPickup + GoToObject 1:3)
+# Mixed-task training helpers (e.g. UnlockPickup + GoToObject 1:3)
 # ---------------------------------------------------------------------------
 
 def parse_mix_spec(spec: str) -> list[tuple[str, int]]:
@@ -220,7 +215,7 @@ def mix_artifact_stem(base: str, mix: list[tuple[str, int]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Curriculum-task helpers (paper §4.4 — KeyCorridor progressive training)
+# Curriculum-task helpers (KeyCorridor progressive training)
 # ---------------------------------------------------------------------------
 
 def parse_curriculum_spec(spec: str) -> list[str]:
@@ -250,16 +245,16 @@ def curriculum_artifact_stem(base: str, envs: list[str]) -> str:
     """Artifact stem for a curriculum run.
 
     Short forms for the two canonical curricula keep filenames readable:
-      - The full paper curriculum (DEFAULT_CURRICULUM) -> ``..._paper``
+      - The full default curriculum (DEFAULT_CURRICULUM) -> ``..._default``
       - A contiguous KeyCorridor-only sweep -> ``..._keycorridor_<first>_to_<last>``
 
     Anything else falls back to listing every env stem joined by ``_``.
 
     Examples::
 
-        # Canonical paper curriculum (GoToDoor x3 -> GoToObject x2 -> KC x6)
+        # Default curriculum (GoToDoor x3 -> GoToObject x2 -> KC x6)
         curriculum_artifact_stem("lgrl_rule", list(DEFAULT_CURRICULUM))
-        -> "lgrl_rule_curriculum_paper"
+        -> "lgrl_rule_curriculum_default"
 
         # KeyCorridor-only ablation
         curriculum_artifact_stem("lgrl_rule",
@@ -275,7 +270,7 @@ def curriculum_artifact_stem(base: str, envs: list[str]) -> str:
         -> "lgrl_rule_curriculum_doorkey5x5_doorkey8x8"
     """
     if tuple(envs) == DEFAULT_CURRICULUM:
-        return f"{base}_curriculum_paper"
+        return f"{base}_curriculum_default"
 
     is_keycorridor_only = all("KeyCorridor" in e for e in envs)
     if is_keycorridor_only and len(envs) >= 2:

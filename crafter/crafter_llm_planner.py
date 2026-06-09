@@ -8,10 +8,9 @@ interface (``get_subgoal(mission, env_json_str, direction, stage_index)
 prompt teaches Crafter's subgoal grammar and tech-tree rules instead of
 MiniGrid's door/key vocabulary.
 
-In the LGRL evaluation the rule-based planner is the training oracle; this
+In our evaluation the rule-based planner is the training oracle; this
 LLM planner is what you swap in to test the *full* framework (LLM
-decomposition + PPO low-level control), matching the paper's "LGRL" and
-"Reasoning-Only" conditions.
+decomposition + PPO low-level control).
 
 Falls back to "collect wood" (the universal first step in Crafter's tech
 tree) on errors or parse failures.

@@ -1,7 +1,7 @@
 """
 Subgoal generation via a local LLM (Ollama + Qwen 2.5 7B).
 
-Produces only subgoals from the LGRL paper plus "go near":
+Produces only the supported subgoals:
   search for, go near, pickup, open, close, drop.
 No "explore" or "go to" subgoals.
 

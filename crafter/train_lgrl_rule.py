@@ -5,7 +5,7 @@ oracle planner.
 Crafter port of the MiniGrid project's ``scripts/train_lgrl_rule.py``.
 Keeps the LGRL "spine" identical:
 
-    planner -> subgoal -> tracker verifies -> reward scaffold (Eqs. 5-7) -> PPO
+    planner -> subgoal -> tracker verifies -> reward scaffold -> PPO
 
 Only the env I/O is Crafter-specific. The reward scaffolding, PPO
 hyperparameters, forward-only stage logic, and per-subgoal time budgets
@@ -65,7 +65,7 @@ NUM_ENVS = 16
 NUM_FRAMES_PER_PROC = 128
 TOTAL_FRAMES = 3_000_000
 
-# PPO hyperparameters (LGRL paper §4.3) — identical to the MiniGrid scripts.
+# PPO hyperparameters — identical to the MiniGrid scripts.
 LR = 1e-4
 DISCOUNT = 0.99
 GAE_LAMBDA = 0.95
@@ -77,7 +77,7 @@ MAX_GRAD_NORM = 0.5
 EPOCHS = 4
 RECURRENCE = 4
 
-# Reward scaffolding (LGRL paper Eqs. 5-7) — identical to the MiniGrid scripts.
+# Reward scaffolding — identical to the MiniGrid scripts.
 R_MISSION = 0.5
 R_SUBGOAL = 0.5
 MISSION_TIME_COEF = 0.5
@@ -227,7 +227,7 @@ def make_env(task, seed):
 
 
 # ---------------------------------------------------------------------------
-# Reward shaping (paper Eqs. 5-7) — Crafter completion via achievement diffs
+# Reward shaping — Crafter completion via achievement diffs
 # ---------------------------------------------------------------------------
 
 def make_reshape_reward(hierarchy_state, logger=None):

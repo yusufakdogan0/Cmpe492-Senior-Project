@@ -12,8 +12,8 @@ both:
 
   * obs is a dict ``{"image": 64x64x3 uint8, "mission": <nl string>}``
   * the episode TERMINATES with reward +1 the step the target
-    achievement unlocks  -> ``success = reward > 0`` (paper Eq. 5 transfers
-    unchanged)
+    achievement unlocks  -> ``success = reward > 0`` (so the mission
+    reward transfers unchanged)
   * the episode TERMINATES with reward 0 on death
   * the episode TRUNCATES with reward 0 at ``max_steps`` (per-task T_max)
 
@@ -129,7 +129,7 @@ class CrafterTaskEnv(gym.Env):
 
         if target_unlocked:
             terminated = True
-            reward = 1.0                      # mission success (Eq. 5 trigger)
+            reward = 1.0                      # mission success
         elif crafter_done:
             terminated = True                 # death before reaching the goal
             reward = 0.0

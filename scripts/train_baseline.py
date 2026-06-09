@@ -12,7 +12,7 @@ Supported environments:
 
 Two training modes:
   - Single-env (--env): all 16 worker envs run the same task.
-  - Mixed-task (--mix, paper §4.5): worker envs split across multiple
+  - Mixed-task (--mix): worker envs split across multiple
     env types, e.g. 4 UnlockPickup + 12 GoToObject. The baseline cannot
     bootstrap UnlockPickup from scratch alone (sparse reward); mix mode
     is the standard setup for that comparison.
@@ -77,7 +77,7 @@ DISCOUNT           = 0.99
 GAE_LAMBDA         = 0.95
 CLIP_EPS           = 0.2
 BATCH_SIZE         = 256
-# Not specified in the paper
+# torch-ac-style defaults
 ENTROPY_COEF       = 0.01
 VALUE_LOSS_COEF    = 0.5
 MAX_GRAD_NORM      = 0.5
@@ -117,7 +117,7 @@ def parse_args():
         metavar="SPEC",
         help=(
             "Mixed-task spec: 'env1:r1,env2:r2'. Total ratio must divide "
-            "NUM_ENVS evenly. Example (paper §4.5): "
+            "NUM_ENVS evenly. Example: "
             "'MiniGrid-UnlockPickup-v0:1,MiniGrid-GoToObject-6x6-N2-v0:3'"
         ),
     )
